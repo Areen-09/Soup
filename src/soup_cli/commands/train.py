@@ -89,8 +89,19 @@ def _format_training_complete_loss(result: dict) -> str:
     return f"Loss: [bold]{result['initial_loss']:.4f} -> {result['final_loss']:.4f}[/]{label}"
 
 
-def _run_auto_eval_after_training(eval_config, output_dir: str, run_id: str) -> None:
-    """Run configured evaluation once after the trained model is saved."""
+def _run_auto_eval_after_training(
+    eval_config,
+    output_dir: str,
+    run_id: str,
+    *,
+    trust_remote_code: bool = False,
+) -> None:
+    """Run configured evaluation once after the trained model is saved.
+
+    ``trust_remote_code`` is the run's own ``--trust-remote-code`` flag (CLI only;
+    there is no soup.yaml field). It reaches only the loads of the trained output
+    and its base: ``benchmark`` and ``custom``.
+    """
     if not eval_config or not getattr(eval_config, "auto_eval", False):
         return
     if not output_dir or not _should_run_diagnose_gate_on_rank():
@@ -112,7 +123,7 @@ def _run_auto_eval_after_training(eval_config, output_dir: str, run_id: str) -> 
                 batch_size=8,
                 run_id=run_id,
                 device=None,
-                trust_remote_code=False,
+                trust_remote_code=trust_remote_code,
             )
         except typer.Exit:
             logger.debug("Auto-eval benchmark skipped", exc_info=True)
@@ -135,7 +146,7 @@ def _run_auto_eval_after_training(eval_config, output_dir: str, run_id: str) -> 
                 run_id=run_id,
                 attach_to_registry=None,
                 output=None,
-                trust_remote_code=False,
+                trust_remote_code=trust_remote_code,
             )
         except Exception as exc:
             logger.exception("Auto-eval custom failed")
@@ -1837,6 +1848,7 @@ def train(
             cfg.eval,
             result["output_dir"],
             run_id,
+            trust_remote_code=trust_remote_code,
         )
     except Exception as exc:
         tracker.fail_run(run_id, error=_describe_exception_for_tracker(exc))
