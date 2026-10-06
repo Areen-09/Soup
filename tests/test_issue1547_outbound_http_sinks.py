@@ -36,6 +36,9 @@ This file implements an inverted sink-based ratchet over the entire
 Limits of this static analysis:
 - An untyped client passed in as a parameter (e.g. ``def send(client, u): client.get(u)``)
   cannot be tracked without dynamic type analysis.
+- Type annotations are not scanned.
+- ``__import__`` reached through builtins / importlib or with keyword arguments (``name=...``)
+  is not resolved.
 - A helper that returns the module indirectly (e.g. ``get_module().post(u)``) is
   not resolved.
 - This test specifically audits ``httpx``, ``urllib.request``, and ``requests``.
@@ -91,6 +94,7 @@ INERT_NAMES: dict[str, frozenset[str]] = {
         "StreamError",
         "SyncByteStream",
         "Timeout",
+        "TimeoutException",
         "TooManyRedirects",
         "TransportError",
         "URL",
@@ -101,31 +105,18 @@ INERT_NAMES: dict[str, frozenset[str]] = {
         "codes",
     }),
     "urllib.request": frozenset({
-        "AbstractBasicAuthHandler",
-        "AbstractDigestAuthHandler",
         "BaseHandler",
-        "CacheFTPHandler",
-        "FileHandler",
-        "FTPHandler",
-        "HTTPBasicAuthHandler",
-        "HTTPDigestAuthHandler",
-        "HTTPErrorProcessor",
-        "HTTPHandler",
         "HTTPPasswordMgr",
         "HTTPPasswordMgrWithDefaultRealm",
         "HTTPPasswordMgrWithPriorAuth",
         "HTTPRedirectHandler",
-        "HTTPSHandler",
-        "ProxyBasicAuthHandler",
-        "ProxyDigestAuthHandler",
-        "ProxyHandler",
         "Request",
-        "UnknownHandler",
     }),
     "requests": frozenset({
         "ConnectionError",
         "ConnectTimeout",
         "HTTPError",
+        "JSONDecodeError",
         "ReadTimeout",
         "Request",
         "RequestException",
@@ -141,6 +132,12 @@ INERT_NAMES: dict[str, frozenset[str]] = {
         "status_codes",
         "structures",
     }),
+}
+
+# Submodules that re-export the sinks: ``httpx._api.post`` is ``httpx.post``.
+PASS_THROUGH: dict[str, frozenset[str]] = {
+    "httpx": frozenset({"_api"}),
+    "requests": frozenset({"api"}),
 }
 
 
@@ -340,10 +337,16 @@ class _ModuleCollector(ast.NodeVisitor):
                     self.module_bindings["urllib"] = "urllib"
             elif alias.name == "urllib":
                 self.module_bindings[alias.asname or "urllib"] = "urllib"
+            elif alias.name.startswith("urllib.") and not alias.asname:
+                self.module_bindings["urllib"] = "urllib"
         self.generic_visit(node)
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
         mod = node.module or ""
+        root, _, sub = mod.partition(".")
+        sub = sub.split(".")[0]
+        if root in PASS_THROUGH and sub in INERT_NAMES[root] and sub not in PASS_THROUGH[root]:
+            return
         if mod == "httpx" or mod.startswith("httpx."):
             for alias in node.names:
                 if alias.name == "*":
@@ -392,6 +395,7 @@ class _SinkVisitor(ast.NodeVisitor):
         self.scope_stack: list[str] = []
         self.shadowed_stack: list[set[str]] = []
         self.sinks: list[tuple[str, int, str]] = []
+        self._qualified: set[int] = set()
 
     def _scope(self) -> str:
         return ".".join(self.scope_stack) if self.scope_stack else "<module>"
@@ -400,12 +404,12 @@ class _SinkVisitor(ast.NodeVisitor):
         return any(name in shadowed for shadowed in self.shadowed_stack)
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
-        for base in node.bases:
-            mod, attr = self._resolve_attr(base)
-            if mod and attr and attr not in INERT_NAMES.get(mod, frozenset()):
-                self.sinks.append((self._scope(), node.lineno, f"{mod}.{attr}"))
+        # bases, keywords and decorators are evaluated in the enclosing scope
+        for outer in [*node.decorator_list, *node.bases, *node.keywords]:
+            self.visit(outer)
         self.scope_stack.append(node.name)
-        self.generic_visit(node)
+        for stmt in node.body:
+            self.visit(stmt)
         self.scope_stack.pop()
 
     def _enter_function(self, name: str, args: ast.arguments) -> None:
@@ -448,12 +452,15 @@ class _SinkVisitor(ast.NodeVisitor):
 
     def _resolve_module(self, node: ast.AST) -> str | None:
         if isinstance(node, ast.Name):
+            if self._is_shadowed(node.id):
+                return None
+            self._qualified.add(id(node))
             return self.b.module_bindings.get(node.id)
         if isinstance(node, ast.Attribute):
             parent = self._resolve_module(node.value)
             if parent == "urllib" and node.attr == "request":
                 return "urllib.request"
-            if parent in ("httpx", "requests"):
+            if parent in ("httpx", "requests") and node.attr in PASS_THROUGH[parent]:
                 return parent
         call_mod = _resolve_call_module(node)
         if call_mod:
@@ -475,9 +482,14 @@ class _SinkVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
     def visit_Name(self, node: ast.Name) -> None:
-        if node.id in self.b.from_bindings and not self._is_shadowed(node.id):
+        if not isinstance(node.ctx, ast.Load) or self._is_shadowed(node.id):
+            return
+        if node.id in self.b.from_bindings:
             mod, attr = self.b.from_bindings[node.id]
             self.sinks.append((self._scope(), node.lineno, f"{mod}.{attr}"))
+        elif node.id in self.b.module_bindings and id(node) not in self._qualified:
+            mod = self.b.module_bindings[node.id]
+            self.sinks.append((self._scope(), node.lineno, f"{mod} (module object)"))
         self.generic_visit(node)
 
     def visit_Call(self, node: ast.Call) -> None:
@@ -656,7 +668,7 @@ class TestOutboundHttpSinksAreDeclared:
 # Energy Endpoint SSRF Hardening Parity & Pin Tests
 # ---------------------------------------------------------------------------
 class TestEnergyEndpointSSRFHardening:
-    """Verifies validate_electricity_map_endpoint uses net_guard and closes bypasses."""
+    """Verifies validate_electricity_map_endpoint uses net_guard and shared policy."""
 
     def test_energy_does_not_declare_private_loopback_set(self) -> None:
         """Pins that energy.py does not define its own _LOOPBACK set."""
@@ -801,11 +813,11 @@ class TestEnergyEndpointSSRFHardening:
 
 
 # ---------------------------------------------------------------------------
-# Mutations That Bypassed The Old #616 Guard
+# Mutations Caught In Addition To The #616 Guard
 # ---------------------------------------------------------------------------
 class TestMutationsThatBypassedTheOldGuard:
-    """Demonstrates, not just asserts: the shapes from #1547 that passed the #616
-    shape-based scan unchecked, but are caught by this sink ratchet."""
+    """Demonstrates, not just asserts: the shapes from #1547 caught in addition to the #616
+    shape-based scan."""
 
     def test_shape1_energy_custom_loopback_set_is_caught(self, tmp_path: Path) -> None:
         """Old energy.py used a private _LOOPBACK set instead of *LOOPBACK_HOSTS."""
@@ -1122,3 +1134,72 @@ def test_shadowed_parameter_name_is_not_flagged() -> None:
         "    return post\n"
     )
     assert find_outbound_sinks(code) == []
+
+
+# ---------------------------------------------------------------------------
+# Review of #1646, round 2
+# ---------------------------------------------------------------------------
+_ROUND2_SPELLINGS = {
+    "urllib: a handler called directly": (
+        "import urllib.request\ndef f(u):\n    req = urllib.request.Request(u)\n"
+        "    return urllib.request.HTTPSHandler().https_open(req)\n"
+    ),
+    "urllib: the file imports only urllib.parse": (
+        "import urllib.parse\ndef f(u):\n    return urllib.request.urlopen(u)\n"
+    ),
+    "httpx: module rebound to another name": (
+        "import httpx\ndef f(u):\n    lib = httpx\n    return lib.post(u)\n"
+    ),
+    "httpx: module passed as an argument": (
+        "import httpx\ndef g(lib, u):\n    return lib.post(u)\n"
+        "def f(u):\n    return g(httpx, u)\n"
+    ),
+    "httpx: helper returns the module": (
+        "def _hx():\n    import httpx\n    return httpx\ndef f(u):\n    return _hx().post(u)\n"
+    ),
+}
+
+
+@pytest.mark.parametrize("spelling", sorted(_ROUND2_SPELLINGS))
+def test_round2_spellings_are_seen(spelling: str) -> None:
+    assert find_outbound_sinks(_ROUND2_SPELLINGS[spelling]), spelling
+
+
+# value: (code, functions that do hold a real reference and may be reported)
+_NOT_SINKS = {
+    "httpx.codes.OK": (
+        "import httpx\ndef f(r):\n    return r.status_code == httpx.codes.OK\n",
+        set(),
+    ),
+    "requests.exceptions.SSLError": (
+        "import requests\ndef f():\n    try:\n        pass\n"
+        "    except requests.exceptions.SSLError:\n        pass\n",
+        set(),
+    ),
+    "from requests.exceptions import SSLError": (
+        "from requests.exceptions import SSLError\ndef f():\n    try:\n        pass\n"
+        "    except SSLError:\n        pass\n",
+        set(),
+    ),
+    "a parameter named request next to `from urllib import request`": (
+        "def a(u):\n    from urllib import request\n    return request.urlopen(u)\n"
+        "def b(request):\n    return request.url\n",
+        {"a"},
+    ),
+    "a name that is only assigned": (
+        "def a(u):\n    from httpx import post\n    return post(u)\n"
+        "def b(blog):\n    post = blog.latest()\n",
+        {"a"},
+    ),
+}
+
+
+@pytest.mark.parametrize("case", sorted(_NOT_SINKS))
+def test_these_are_not_reported(case: str) -> None:
+    code, real = _NOT_SINKS[case]
+    assert [hit for hit in find_outbound_sinks(code) if hit[0] not in real] == []
+
+
+def test_a_class_base_is_reported_once_in_the_enclosing_scope() -> None:
+    hits = find_outbound_sinks("import httpx\nclass C(httpx.Client):\n    pass\n")
+    assert hits == [("<module>", 2, "httpx.Client")]
