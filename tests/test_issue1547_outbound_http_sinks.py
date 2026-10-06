@@ -815,7 +815,7 @@ class TestEnergyEndpointSSRFHardening:
 # ---------------------------------------------------------------------------
 # Mutations Caught In Addition To The #616 Guard
 # ---------------------------------------------------------------------------
-class TestMutationsThatBypassedTheOldGuard:
+class TestMutationsCaughtInAdditionToTheOldGuard:
     """Demonstrates, not just asserts: the shapes from #1547 caught in addition to the #616
     shape-based scan."""
 
@@ -1096,7 +1096,7 @@ def test_a_file_that_does_not_parse_is_an_error_not_an_empty_result() -> None:
         find_outbound_sinks("import httpx\ndef f(:\n    httpx.post(u)\n")
 
 
-def test_assigned_importlib_call_is_caught(tmp_path: Path) -> None:
+def test_assigned_importlib_call_is_caught() -> None:
     code = (
         "import importlib\n"
         "def f(u):\n"
@@ -1167,6 +1167,16 @@ def test_round2_spellings_are_seen(spelling: str) -> None:
 
 # value: (code, functions that do hold a real reference and may be reported)
 _NOT_SINKS = {
+    "httpx.TimeoutException": (
+        "import httpx\ndef f():\n    try:\n        pass\n"
+        "    except httpx.TimeoutException:\n        pass\n",
+        set(),
+    ),
+    "requests.JSONDecodeError": (
+        "import requests\ndef f():\n    try:\n        pass\n"
+        "    except requests.JSONDecodeError:\n        pass\n",
+        set(),
+    ),
     "httpx.codes.OK": (
         "import httpx\ndef f(r):\n    return r.status_code == httpx.codes.OK\n",
         set(),
@@ -1201,5 +1211,76 @@ def test_these_are_not_reported(case: str) -> None:
 
 
 def test_a_class_base_is_reported_once_in_the_enclosing_scope() -> None:
-    hits = find_outbound_sinks("import httpx\nclass C(httpx.Client):\n    pass\n")
+    code = (
+        "import httpx\n"
+        "class C(httpx.Client):\n"
+        "    def get(self, u):\n"
+        "        pass\n"
+        "    def post(self, u):\n"
+        "        pass\n"
+    )
+    hits = find_outbound_sinks(code)
     assert hits == [("<module>", 2, "httpx.Client")]
+
+
+# ---------------------------------------------------------------------------
+# Branch coverage pins for Round 2 review
+# ---------------------------------------------------------------------------
+def test_from_private_submodule_import_is_caught() -> None:
+    code = "from httpx._api import post\ndef f(u):\n    post(u)\n"
+    assert ("f", "httpx.post") in [(func, call) for func, _line, call in find_outbound_sinks(code)]
+
+
+def test_builtins_getattr_is_caught() -> None:
+    code = "import builtins\nimport httpx\ndef f(u):\n    builtins.getattr(httpx, 'post')(u)\n"
+    calls = [(func, call) for func, _line, call in find_outbound_sinks(code)]
+    assert ("f", "httpx.post") in calls
+
+
+def test_decorator_referencing_sink_is_caught() -> None:
+    code = "import httpx\ndef dec(fn):\n    return fn\n@dec(httpx.post)\ndef f():\n    pass\n"
+    calls = [(func, call) for func, _line, call in find_outbound_sinks(code)]
+    assert ("<module>", "httpx.post") in calls
+
+
+def test_variable_annotation_is_not_flagged() -> None:
+    code = "import httpx\ndef f():\n    client: httpx.Client\n"
+    assert find_outbound_sinks(code) == []
+
+
+def test_inert_from_import_is_not_flagged() -> None:
+    code = (
+        "from httpx import HTTPError\n"
+        "def f():\n"
+        "    try:\n"
+        "        pass\n"
+        "    except HTTPError:\n"
+        "        pass\n"
+    )
+    assert find_outbound_sinks(code) == []
+
+
+def test_assigned_importlib_call_resolves_module_sinks() -> None:
+    code = (
+        "import importlib\n"
+        "def f(u):\n"
+        "    mod = importlib.import_module('httpx')\n"
+        "    mod.post(u)\n"
+    )
+    calls = [(func, call) for func, _line, call in find_outbound_sinks(code)]
+    assert ("f", "httpx.post") in calls
+
+
+def test_call_multiset_mismatch_with_equal_call_count() -> None:
+    dummy_ledger = {
+        ("mod.py", "f"): DeclaredSink(calls=("httpx.get", "httpx.post"), reason="ok")
+    }
+    mock_hits = [
+        ("mod.py", "f", 10, "httpx.post"),
+        ("mod.py", "f", 15, "httpx.post"),
+    ]
+    unlisted = unlisted_sinks(mock_hits, dummy_ledger)
+    assert unlisted == [
+        "mod.py:10 in f() calls mismatch: "
+        "expected ['httpx.get', 'httpx.post'], found ['httpx.post', 'httpx.post']"
+    ]
