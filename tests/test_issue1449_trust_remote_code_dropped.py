@@ -496,7 +496,7 @@ class TestDefaultsStayDeny:
         ("passed_flag", "expected"),
         [(False, False), (True, True)],
     )
-    def test_training_auto_eval_callback_never_opts_in(
+    def test_training_auto_eval_follows_run_flag(
         self, monkeypatch, passed_flag, expected
     ):
         import soup_cli.commands.eval as ce

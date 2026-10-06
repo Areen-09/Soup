@@ -8,7 +8,10 @@ only and never comes from a soup.yaml.
 
 from __future__ import annotations
 
+import ast
+import inspect
 import json
+import textwrap
 from unittest.mock import MagicMock
 
 import pytest
@@ -210,3 +213,47 @@ class TestSoupTrainCliAutoEvalTrust:
         assert eval_calls[0][1]["trust_remote_code"] is expected_trust
         assert eval_calls[1][0] == "custom"
         assert eval_calls[1][1]["trust_remote_code"] is expected_trust
+
+
+def test_omitted_kwarg_stays_off(monkeypatch):
+    import soup_cli.commands.eval as ce
+    import soup_cli.commands.train as train_cmd
+
+    calls = []
+    monkeypatch.setattr(ce, "benchmark", lambda **kw: calls.append(("benchmark", kw)))
+    monkeypatch.setattr(ce, "custom", lambda **kw: calls.append(("custom", kw)))
+    monkeypatch.setattr(train_cmd, "_should_run_diagnose_gate_on_rank", lambda: True)
+
+    eval_config = EvalConfig(auto_eval=True, benchmarks=["mmlu"], custom_tasks="tasks.jsonl")
+    train_cmd._run_auto_eval_after_training(eval_config, "out_dir", "run-1")
+
+    assert [(name, kw["trust_remote_code"]) for name, kw in calls] == [
+        ("benchmark", False),
+        ("custom", False),
+    ]
+
+
+def test_flag_has_exactly_two_consumers():
+    import soup_cli.commands.train as train_cmd
+
+    source = textwrap.dedent(inspect.getsource(train_cmd._run_auto_eval_after_training))
+    tree = ast.parse(source)
+
+    consumers = sorted(
+        ast.unparse(node.func)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        for kw in node.keywords
+        if kw.arg == "trust_remote_code"
+    )
+    reads = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Name)
+        and node.id == "trust_remote_code"
+        and isinstance(node.ctx, ast.Load)
+    ]
+
+    assert consumers == ["benchmark", "custom"], consumers
+    assert len(reads) == 2, len(reads)
+
