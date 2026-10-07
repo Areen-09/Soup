@@ -39,8 +39,6 @@ Limits of this static analysis:
 - Type annotations are not scanned.
 - ``__import__`` reached through builtins / importlib or with keyword arguments (``name=...``)
   is not resolved.
-- A helper that returns the module indirectly (e.g. ``get_module().post(u)``) is
-  not resolved.
 - This test specifically audits ``httpx``, ``urllib.request``, and ``requests``.
   Other connection vectors (``urllib3``, ``http.client``, ``aiohttp``, ``socket``,
   ``websockets``, subprocesses, or SDK-level endpoint configs) are not scanned;
@@ -1284,3 +1282,38 @@ def test_call_multiset_mismatch_with_equal_call_count() -> None:
         "mod.py:10 in f() calls mismatch: "
         "expected ['httpx.get', 'httpx.post'], found ['httpx.post', 'httpx.post']"
     ]
+
+
+# ---------------------------------------------------------------------------
+# Optional pins: each class in urllib.request that opens a connection (or
+# configures the pipeline that does) is reported under its own name, so a
+# later edit of INERT_NAMES["urllib.request"] cannot take one back out quietly.
+# ---------------------------------------------------------------------------
+_CONNECTION_HANDLERS = {
+    "HTTPHandler": "http_open",
+    "HTTPSHandler": "https_open",
+    "FTPHandler": "ftp_open",
+    "CacheFTPHandler": "ftp_open",
+}
+
+
+@pytest.mark.parametrize("name", sorted(_CONNECTION_HANDLERS))
+def test_a_handler_that_opens_a_connection_is_reported_under_its_own_name(name: str) -> None:
+    method = _CONNECTION_HANDLERS[name]
+    code = f"import urllib.request\ndef f(req):\n    return urllib.request.{name}().{method}(req)\n"
+    calls = [call for _scope, _line, call in find_outbound_sinks(code)]
+    assert f"urllib.request.{name}" in calls, (name, calls)
+
+
+def test_a_proxy_handler_is_reported_under_its_own_name() -> None:
+    code = "import urllib.request\ndef f(p):\n    return urllib.request.ProxyHandler(p)\n"
+    calls = [call for _scope, _line, call in find_outbound_sinks(code)]
+    assert "urllib.request.ProxyHandler" in calls, calls
+
+
+def test_class_decorators_and_keywords_are_read_in_the_enclosing_scope() -> None:
+    decorated = find_outbound_sinks("import httpx\n@httpx.post\nclass C:\n    pass\n")
+    assert decorated == [("<module>", 2, "httpx.post")]
+    keyword = find_outbound_sinks("import httpx\nclass C(metaclass=httpx.Client):\n    pass\n")
+    assert keyword == [("<module>", 2, "httpx.Client")]
+
