@@ -256,4 +256,11 @@ def test_flag_has_exactly_two_consumers():
 
     assert consumers == ["benchmark", "custom"], consumers
     assert len(reads) == 2, len(reads)
-
+    values = [
+        ast.unparse(kw.value)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        for kw in node.keywords
+        if kw.arg == "trust_remote_code"
+    ]
+    assert values == ["trust_remote_code", "trust_remote_code"], values
