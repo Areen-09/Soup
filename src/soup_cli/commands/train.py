@@ -89,6 +89,29 @@ def _format_training_complete_loss(result: dict) -> str:
     return f"Loss: [bold]{result['initial_loss']:.4f} -> {result['final_loss']:.4f}[/]{label}"
 
 
+def _format_duration_display(result: dict) -> str:
+    """Duration line for the completion panel (#1529).
+
+    Every trainer wrapper returns both a pre-formatted ``duration`` string and
+    the raw ``duration_secs`` — except unlearn, which until #1529 returned only
+    the seconds, so the panel's ``result['duration']`` raised ``KeyError``
+    AFTER the adapter was saved and the run was otherwise complete. Read the
+    string when present and fall back to formatting the seconds (``unknown``
+    when both are missing — a measured ``0m`` stays ``0m``, but an absent
+    measurement should not read as a zero) so no wrapper can lose a finished
+    run's summary.
+    """
+    duration = result.get("duration")
+    if duration:
+        return duration
+    duration_secs = result.get("duration_secs")
+    if duration_secs is None:
+        return "unknown"
+    hours = int(duration_secs // 3600)
+    minutes = int((duration_secs % 3600) // 60)
+    return f"{hours}h {minutes}m" if hours > 0 else f"{minutes}m"
+
+
 def _run_auto_eval_after_training(
     eval_config,
     output_dir: str,
@@ -147,6 +170,11 @@ def _run_auto_eval_after_training(
                 attach_to_registry=None,
                 output=None,
                 trust_remote_code=trust_remote_code,
+            )
+        except typer.Exit:
+            logger.debug("Auto-eval custom skipped", exc_info=True)
+            console.print(
+                "[yellow]Auto-eval custom skipped (see the message above)[/]"
             )
         except Exception as exc:
             logger.exception("Auto-eval custom failed")
@@ -1224,14 +1252,16 @@ def train(
                 format_advice,
                 hint_argv_from_reexec,
                 is_in_distributed,
+                run_launcher,
             )
 
             num_processes = num_gpus * nodes
             if not is_in_distributed():
                 # v0.33.0 #37 — auto-reexec under accelerate launch unless
-                # --no-reexec was passed. Reexec uses os.execvp so the new
-                # accelerate process replaces this process; no leftover PID
-                # tree, stdio passes through unchanged.
+                # --no-reexec was passed. On POSIX the accelerate process
+                # replaces this one (os.execvp): no leftover PID tree, stdio
+                # passes through unchanged. Windows cannot do that, so there
+                # this process waits for the launcher (see run_launcher).
                 # #372 — one argv builder for both the re-exec and the printed
                 # hint, so they cannot drift. collect_reexec_passthrough is the
                 # only list of "flags the user typed" that survive a launch.
@@ -1321,15 +1351,19 @@ def train(
                         f"({num_processes} GPUs, {topo['interconnect']})[/]"
                     )
                     console.print(f"[dim]argv: {markup_escape(' '.join(argv))}[/]")
-                    # execvp replaces this process; the child carries --no-reexec.
+                    # The launcher takes over; the child carries --no-reexec. On
+                    # POSIX run_launcher execs and never returns. On Windows,
+                    # where exec would return 0 at once and leave the launcher
+                    # running, it waits and returns the launcher's exit code.
                     try:
-                        os.execvp(argv[0], argv)
+                        launcher_code = run_launcher(argv)
                     except OSError as exc:
                         console.print(
                             f"[red]accelerate launch failed:[/] {markup_escape(str(exc))}\n"
                             "Use [bold]--no-reexec[/] to print the launch command."
                         )
                         raise typer.Exit(1) from exc
+                    raise typer.Exit(launcher_code)
             elif not dry_run:
                 # Already a launched rank — announce + apply NCCL hints. (The
                 # dry_run branch above intentionally does neither.)
@@ -1590,6 +1624,23 @@ def train(
                 "[dim] to soup.yaml for 2-5x faster training.[/]"
             )
 
+    # #1613: cheap stripe roots validation ahead of confirmation, --dry-run,
+    # dataset loading, and run creation.
+    from soup_cli.utils.stripe_roots import STRIPE_DIRS_ENV
+
+    if getattr(getattr(cfg, "training", None), "stream_layers", False) and os.environ.get(
+        STRIPE_DIRS_ENV
+    ):
+        from soup_cli.utils.errors import format_friendly_error
+        from soup_cli.utils.layer_shard import resolve_cache_root
+        from soup_cli.utils.stripe_roots import StripeRootError, validate_early_stripe_roots
+
+        try:
+            validate_early_stripe_roots(resolve_cache_root())
+        except StripeRootError as exc:
+            format_friendly_error(exc)
+            raise typer.Exit(1) from exc
+
     if not dry_run and not yes:
         if not typer.confirm("Start training?", default=True):
             console.print("[yellow]Cancelled.[/]")
@@ -1828,7 +1879,15 @@ def train(
         raise
 
     try:
-        with profiler_ctx, energy_ctx:
+        with profiler_ctx as profiler, energy_ctx:
+            if profile_run and profiler is not None:
+                from soup_cli.utils.profiling import attach_profile_callback
+
+                if not attach_profile_callback(trainer_wrapper, profiler):
+                    console.print(
+                        "[yellow]--profile:[/] this trainer has no step hook, "
+                        "so no trace will be written"
+                    )
             result = trainer_wrapper.train(
                 display=display, tracker=tracker, run_id=run_id,
                 resume_from_checkpoint=resume_from,
@@ -1887,7 +1946,7 @@ def train(
     console.print(
         Panel(
             f"{_format_training_complete_loss(result)}\n"
-            f"Duration: [bold]{result['duration']}[/]\n"
+            f"Duration: [bold]{_format_duration_display(result)}[/]\n"
             f"Output: [bold]{result['output_dir']}[/]\n"
             f"Run ID: [bold]{run_id}[/]\n\n"
             f"Quick test:  [bold]soup chat --model {result['output_dir']}[/]\n"
@@ -1901,17 +1960,9 @@ def train(
 
     # --- v0.56.0 --diagnose-gate: post-training failure-mode check ---
     if diagnose_gate and _should_run_diagnose_gate_on_rank():
-        try:
-            _run_diagnose_gate(
-                diagnose_gate, run_id, cfg.base, result["output_dir"]
-            )
-        except typer.Exit:
-            raise
-        except (OSError, ValueError) as exc:
-            console.print(
-                f"[red]--diagnose-gate failed:[/] {type(exc).__name__}: {exc}"
-            )
-            raise typer.Exit(1) from exc
+        _run_diagnose_gate_or_exit(
+            diagnose_gate, run_id, cfg.base, result["output_dir"]
+        )
 
     # --- v0.71.3 #180 --track-energy: print the measured energy/CO2 -------
     energy_measurement = (
@@ -2008,8 +2059,9 @@ def _write_annex_xi(out_path: str, run_id: str, cfg, *, energy=None) -> None:
     )
 
     modality = getattr(cfg, "modality", "text") or "text"
-    energy_kwh = float(getattr(energy, "energy_kwh", 0.0)) if energy is not None else 0.0
-    co2_kg = float(getattr(energy, "co2_kg", 0.0)) if energy is not None else 0.0
+    # #1446: without --track-energy nothing was measured; say so instead of 0.000.
+    energy_kwh = float(getattr(energy, "energy_kwh", 0.0)) if energy is not None else None
+    co2_kg = float(getattr(energy, "co2_kg", 0.0)) if energy is not None else None
     raw_train = getattr(cfg.data, "train", "") or ""
     # #443 — pass the raw str|list through so top-domain extraction
     # aggregates across every interleaved dataset, instead of stringifying
@@ -2027,7 +2079,7 @@ def _write_annex_xi(out_path: str, run_id: str, cfg, *, energy=None) -> None:
         task=str(cfg.task),
         dataset_summary=train_display,
         modalities=(modality,),
-        train_compute_flops=0.0,
+        train_compute_flops=None,  # #1446: Soup does not measure FLOPs; never claim 0
         train_energy_kwh=energy_kwh,
         train_co2_kg=co2_kg,
         top_domains=top_domains,
@@ -2223,6 +2275,7 @@ def _run_diagnose_gate(
     from soup_cli.utils.diagnose.report import FAILURE_MODES, FailureScore
     from soup_cli.utils.diagnose.runner import build_report
     from soup_cli.utils.paths import enforce_under_cwd_and_no_symlink
+    from soup_cli.utils.terminal import for_terminal
 
     enforce_under_cwd_and_no_symlink(evidence_path, "--diagnose-gate evidence")
     # 16 MiB cap on evidence JSON (security review HIGH — symmetric with
@@ -2271,7 +2324,7 @@ def _run_diagnose_gate(
         for mode in FAILURE_MODES:
             sc = report.scores[mode]
             if sc.verdict == "MAJOR":
-                console.print(f"  [red]MAJOR[/] {mode}: {markup_escape(sc.evidence)}")
+                console.print(f"  [red]MAJOR[/] {mode}: {for_terminal(sc.evidence)}")
         raise typer.Exit(2)
     if report.overall == "NOT_RUN":
         # An unmeasured mode is not a pass (#1435); same exit as `soup diagnose`.
@@ -2282,12 +2335,29 @@ def _run_diagnose_gate(
         for mode in FAILURE_MODES:
             sc = report.scores[mode]
             if sc.verdict == "NOT_RUN":
-                console.print(f"  [yellow]NOT_RUN[/] {mode}: {markup_escape(sc.evidence)}")
+                console.print(f"  [yellow]NOT_RUN[/] {mode}: {for_terminal(sc.evidence)}")
         raise typer.Exit(EXIT_USAGE_ERROR)
     console.print(
         f"[green]--diagnose-gate: {report.overall}[/] across "
         f"{len(FAILURE_MODES)} modes."
     )
+
+
+def _run_diagnose_gate_or_exit(
+    evidence_path: str, run_id: str, base: str, adapter: str
+) -> None:
+    """Run the gate; an unreadable or refused evidence file is reported and exits 1."""
+    from soup_cli.utils.terminal import for_terminal
+
+    try:
+        _run_diagnose_gate(evidence_path, run_id, base, adapter)
+    except typer.Exit:
+        raise
+    except (OSError, ValueError) as exc:
+        console.print(
+            f"[red]--diagnose-gate failed:[/] {type(exc).__name__}: {for_terminal(exc)}"
+        )
+        raise typer.Exit(1) from exc
 
 
 def _resolve_deepspeed(deepspeed: str) -> str:

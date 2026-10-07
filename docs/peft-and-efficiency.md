@@ -177,12 +177,12 @@ data:
 training:
   quantization: none            # block expansion needs an unquantized base
   expand_layers: 4              # append 4 zero-init decoder blocks
-  freeze_trainable_layers: 4    # train only the appended blocks (requires expand_layers)
+  freeze_trainable_layers: 4    # must equal expand_layers: freeze the original model, train only the appended blocks
   lr: 5e-5
   epochs: 1
 ```
 
-**What happens at trainer start.** Soup deep-copies the last `expand_layers` decoder blocks, zero-inits each clone's residual projections (`mlp.down_proj` + `self_attn.o_proj`) so the appended block initially acts as identity, appends them to `model.model.layers`, and updates `config.num_hidden_layers`. When `freeze_trainable_layers > 0` is set, every parameter except the appended blocks is frozen — this is the canonical LLaMA Pro "train only new blocks" recipe.
+**What happens at trainer start.** Soup deep-copies the last `expand_layers` decoder blocks, zero-inits each clone's residual projections (`mlp.down_proj` + `self_attn.o_proj`) so the appended block initially acts as identity, appends them to `model.model.layers`, and updates `config.num_hidden_layers`. `freeze_trainable_layers` must equal `expand_layers`: it freezes every parameter except the appended blocks, the canonical LLaMA Pro "train only new blocks" recipe. It does not select the top-N or bottom-N layers, and any other value, including `0` or a negative one, is refused at config load.
 
 **Scope.** Works on `task: sft` and `task: pretrain` with `backend: transformers`, `modality: text` and `quantization: none`; any other combination is refused at config load. No other trainer applies the expansion, and the appended blocks are only supported on an unquantized base. Bounds: `expand_layers ∈ [1, 64]`. Over-expansion (more new blocks than the base has layers) silently clamps to the base layer count. Non-Llama-shaped architectures (e.g. Falcon's `dense_4h_to_h`) emit a `warnings.warn` because the residual zero-init heuristic only matches the standard `down_proj` / `o_proj` names — the appended blocks are still appended + trainable, but lose the identity-init guarantee.
 
@@ -208,7 +208,7 @@ training:
     loftq_iter: 1
     loftq_bits: 4
 
-  # LLaMA Pro block expansion (schema only in v0.41.0; live wiring in v0.41.1)
+  # LLaMA Pro block expansion (freeze_trainable_layers must equal expand_layers)
   expand_layers: 4
   freeze_trainable_layers: 4
 ```
@@ -521,8 +521,10 @@ training:
 Freeze bottom layers of the model — train only the top layers (like LLaMA-Factory's `finetuning_type: freeze`).
 Only `task: sft` (and `tts`, which trains through the SFT trainer) applies these two fields; on any
 other task the config is refused at load, because that trainer would train every layer (#1497).
-Within `sft` they are applied on the transformers text path only: `backend: mlx`, `backend: unsloth`,
-`modality: vision`, `modality: audio` and `stream_layers: true` still load them and train every layer.
+Within `sft` and `tts` they are applied on the text path with `backend: transformers` only:
+`backend: mlx`, `backend: unsloth`, `modality: vision`, `modality: audio` and `stream_layers: true`
+are refused at load too: those setups never read the fields and always attach an adapter, so the run
+would train every layer (#1581).
 
 ```yaml
 training:
@@ -681,6 +683,8 @@ training:
 
 Picks `bf16` on Ampere+, `fp16` on Turing or known fp16-stable models (Qwen2 / Qwen2.5 / Phi-3 / Phi-3.5), `no` on pre-Pascal. Multi-version pairs (`qwen2.5` vs `qwen2`, `phi-3.5` vs `phi-3`) match the longest substring deterministically.
 
+Only `task: sft` reads the field (and `task: tts`, which trains through the SFT trainer); since #1618, setting it on any other task is refused at config load, because those trainers pick bf16/fp16 on their own and would train at their default precision regardless of this key.
+
 The experimental QuEST route (`quantization_aware: quest`) refuses this flag at
 config load because its evidence covers BF16, not FP16; see the
 [QuEST evidence boundary](performance-and-quantization.md#evidence-boundary).
@@ -721,7 +725,7 @@ training:
   grad_accum_pressure_threshold: 0.92
 ```
 
-Records peak memory each step. When pressure crosses the threshold, recommends a new `(batch, accum)` pair preserving effective batch (capped at `accum=1024`).
+Records peak memory each step. Pressure is peak allocated memory divided by the total memory of the CUDA device the run uses (#1620), so the threshold means the same thing on a 4 GB laptop card and on an 80 GB accelerator. When pressure crosses the threshold, recommends a new `(batch, accum)` pair preserving effective batch (capped at `accum=1024`), together with the measured peak and total.
 
 > **Backend Note:** Setting `grad_accum_auto_tune: true` is refused on `backend: mlx` at config validation (there is no VRAM total to measure pressure against on unified memory).
 
