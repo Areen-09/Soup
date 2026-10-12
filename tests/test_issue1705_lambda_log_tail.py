@@ -1,14 +1,18 @@
 """Tests for Lambda Cloud controller remote log tail printing on failure (#1705).
 
 Verifies that the rendered Lambda controller:
-1. Captures remote log tail over SSH when remote training exits with non-zero status.
-2. Prints the log tail strictly before verifying instance termination.
-3. Proceeds with instance termination even if the log tail fetch fails, times out, or errors.
-4. Leaves the controller exit status unchanged on fetch errors (rc == 1).
-5. Sanitizes untrusted remote output by stripping ESC, C0, DEL, and C1 control sequences
-   (such as OSC window title sequences) while preserving tab and newline.
-6. Enforces bounds: at most 50 lines and 50 KB byte cap.
-7. Prints no log tail on successful runs (exit 0).
+1. Embeds output redirection via tee under pipefail in user_data.
+2. Captures remote log tail over SSH when remote training exits with non-zero status.
+3. Passes short timeout and utf-8 replace encoding to subprocess.run.
+4. Prints the log tail strictly before verifying instance termination.
+5. Proceeds with instance termination even if the log tail fetch fails, times out, or errors.
+6. Leaves the controller exit status unchanged on fetch errors (rc == 1).
+7. Sanitizes untrusted remote output (both stdout and stderr failure notices) by stripping
+   ESC, C0, DEL, and C1 control sequences (such as OSC window title sequences) and capping
+   failure details at 200 characters.
+8. Enforces line cap (at most 50 lines) independently of byte cap.
+9. Enforces byte cap (at most 50 KB) independently of line cap.
+10. Prints no log tail on successful runs (exit 0).
 """
 
 from __future__ import annotations
@@ -79,12 +83,27 @@ def _exec(
 
 
 class TestLambdaLogTailOnFailure:
+    def test_user_data_pipes_train_log_under_pipefail(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        stub = _setup_env(tmp_path, monkeypatch)
+        namespace: dict[str, object] = {}
+        exec(stub, namespace)
+        user_data = str(namespace["_USER_DATA"])
+
+        pipefail_stmt = "set -euo pipefail"
+        tee_stmt = "soup train --config soup.yaml --yes 2>&1 | tee /home/ubuntu/soup/train.log"
+
+        assert pipefail_stmt in user_data
+        assert tee_stmt in user_data
+        assert user_data.index(pipefail_stmt) < user_data.index(tee_stmt)
+
     def test_remote_exit_1_prints_log_tail_before_instance_termination(
         self, tmp_path: Path, monkeypatch
     ) -> None:
         stub = _setup_env(tmp_path, monkeypatch)
         prints: list[str] = []
-        commands: list[list[str]] = []
+        tail_kwargs: list[dict] = []
 
         sample_tail = (
             "Traceback (most recent call last):\n"
@@ -93,13 +112,11 @@ class TestLambdaLogTailOnFailure:
         )
 
         def fake_run(argv, **kw):
-            commands.append(argv)
             if argv[0] == "ssh":
-                # Check whether this is poll or log tail
                 cmd_str = argv[-1]
                 if "tail" in cmd_str:
+                    tail_kwargs.append(kw)
                     return subprocess.CompletedProcess(argv, 0, sample_tail, "")
-                # status poll
                 return subprocess.CompletedProcess(argv, 0, "status: error\n1\n", "")
             return subprocess.CompletedProcess(argv, 0, "", "")
 
@@ -109,10 +126,11 @@ class TestLambdaLogTailOnFailure:
         assert len(terminations) == 1
         assert terminations[0][2] == {"instance_ids": ["instance-1"]}
 
-        # Verify tail command was called
-        tail_cmds = [cmd for cmd in commands if cmd[0] == "ssh" and "tail" in cmd[-1]]
-        assert len(tail_cmds) == 1
-        assert "tail -n 50 /home/ubuntu/soup/train.log" in tail_cmds[0][-1]
+        # Verify tail command arguments & options
+        assert len(tail_kwargs) == 1
+        assert tail_kwargs[0].get("timeout") == 15
+        assert tail_kwargs[0].get("encoding") == "utf-8"
+        assert tail_kwargs[0].get("errors") == "replace"
 
         # Verify log tail is in printed output
         assert any("FileNotFoundError: data.jsonl not found" in p for p in prints)
@@ -143,24 +161,22 @@ class TestLambdaLogTailOnFailure:
 
         assert rc == 1
         assert len(terminations) == 1
-        # Printed failure notice is concise
         notices = [p for p in prints if "Could not fetch remote log tail" in p]
         assert len(notices) == 1
-        # Termination was still verified
         assert any("Lambda instance termination verified" in p for p in prints)
 
-    def test_stubbed_fetch_ssh_error_still_terminates_instance_with_exit_1(
+    def test_stubbed_fetch_ssh_stderr_strips_control_bytes_and_caps_200(
         self, tmp_path: Path, monkeypatch
     ) -> None:
         stub = _setup_env(tmp_path, monkeypatch)
         prints: list[str] = []
 
+        raw_stderr = "\x1b]0;PWNED\x07\x1b[2Jremote failure: " + ("x" * 300)
+
         def fake_run(argv, **kw):
             if argv[0] == "ssh":
                 if "tail" in argv[-1]:
-                    return subprocess.CompletedProcess(
-                        argv, 255, "", "Connection to 192.0.2.1 closed by remote host."
-                    )
+                    return subprocess.CompletedProcess(argv, 255, "", raw_stderr)
                 return subprocess.CompletedProcess(argv, 0, "status: error\n2\n", "")
             return subprocess.CompletedProcess(argv, 0, "", "")
 
@@ -170,7 +186,46 @@ class TestLambdaLogTailOnFailure:
         assert len(terminations) == 1
         notices = [p for p in prints if "Could not fetch remote log tail" in p]
         assert len(notices) == 1
-        assert "Connection to 192.0.2.1 closed by remote host." in notices[0]
+        notice = notices[0]
+
+        # Verify control bytes stripped from stderr notice
+        assert "\x1b" not in notice
+        assert "\x07" not in notice
+        assert "[2Jremote failure:" in notice
+
+        # Prefix is 'Could not fetch remote log tail: ' (32 chars) + at most 200 detail chars
+        detail = notice.replace("Could not fetch remote log tail: ", "")
+        assert len(detail) <= 200
+        assert any("Lambda instance termination verified" in p for p in prints)
+
+    def test_stubbed_fetch_oserror_still_terminates_instance_with_exit_1(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        stub = _setup_env(tmp_path, monkeypatch)
+        prints: list[str] = []
+
+        raw_err = "\x1b[31mssh binary execution error\x1b[0m: " + ("y" * 300)
+
+        def fake_run(argv, **kw):
+            if argv[0] == "ssh":
+                if "tail" in argv[-1]:
+                    raise OSError(raw_err)
+                return subprocess.CompletedProcess(argv, 0, "status: error\n1\n", "")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        rc, terminations = _exec(stub, fake_run, captured_prints=prints)
+
+        assert rc == 1
+        assert len(terminations) == 1
+        notices = [p for p in prints if "Could not fetch remote log tail" in p]
+        assert len(notices) == 1
+        notice = notices[0]
+
+        # Verify control bytes stripped and length capped
+        assert "\x1b" not in notice
+        assert "ssh binary execution error" in notice
+        detail = notice.replace("Could not fetch remote log tail: ", "")
+        assert len(detail) <= 200
         assert any("Lambda instance termination verified" in p for p in prints)
 
     def test_log_tail_strips_control_bytes_and_osc_title_escape(
@@ -179,7 +234,6 @@ class TestLambdaLogTailOnFailure:
         stub = _setup_env(tmp_path, monkeypatch)
         prints: list[str] = []
 
-        # OSC window title escape sequence + ANSI color codes + C0/C1 control bytes
         raw_log = (
             "\x1b]0;Attacker Title\x07"
             "Normal error line with \ttab\n"
@@ -209,15 +263,50 @@ class TestLambdaLogTailOnFailure:
         assert "Attacker TitleNormal error line with \ttab" in tail_block
         assert "[31mRed text[0m" in tail_block
 
-    def test_log_tail_enforces_line_and_byte_caps(
+    def test_log_tail_enforces_line_cap_with_more_than_50_short_lines(
         self, tmp_path: Path, monkeypatch
     ) -> None:
         stub = _setup_env(tmp_path, monkeypatch)
         prints: list[str] = []
 
-        # 100 lines, each 1000 characters (total 100,000 bytes, exceeds 50 KB cap)
-        lines_100 = [f"line-{i:03d} " + ("x" * 980) for i in range(100)]
-        oversized_log = "\n".join(lines_100) + "\n"
+        # 100 short lines (~15 bytes each, total ~1,500 bytes << 50 KB byte cap)
+        short_lines = [f"short line {i:03d}" for i in range(100)]
+        log_text = "\n".join(short_lines) + "\n"
+
+        def fake_run(argv, **kw):
+            if argv[0] == "ssh":
+                if "tail" in argv[-1]:
+                    return subprocess.CompletedProcess(argv, 0, log_text, "")
+                return subprocess.CompletedProcess(argv, 0, "status: error\n1\n", "")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        rc, _ = _exec(stub, fake_run, captured_prints=prints)
+        assert rc == 1
+
+        tail_block = next(p for p in prints if "Remote log tail" in p)
+        content_lines = [line for line in tail_block.splitlines() if line.startswith("short line")]
+
+        # Exactly 50 lines kept
+        assert len(content_lines) == 50
+        # Newest line is present
+        assert "short line 099" in content_lines
+        # Oldest line (000) was trimmed
+        assert "short line 000" not in content_lines
+        # 50th line from end is the earliest kept
+        assert "short line 050" in content_lines
+        assert "short line 049" not in content_lines
+
+    def test_log_tail_enforces_byte_cap_with_few_very_long_lines(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        stub = _setup_env(tmp_path, monkeypatch)
+        prints: list[str] = []
+
+        # 3 lines of 30,000 bytes each (total 90,000 bytes > 50,000 bytes cap, but only 3 lines)
+        line_0 = "oldest line: " + ("a" * 29980)
+        line_1 = "middle line: " + ("b" * 29980)
+        line_2 = "newest line: " + ("c" * 29980)
+        oversized_log = f"{line_0}\n{line_1}\n{line_2}\n"
 
         def fake_run(argv, **kw):
             if argv[0] == "ssh":
@@ -230,18 +319,14 @@ class TestLambdaLogTailOnFailure:
         assert rc == 1
 
         tail_block = next(p for p in prints if "Remote log tail" in p)
-        # Byte cap check: printed block must be bounded
-        assert len(tail_block.encode("utf-8")) <= 60_000
+        # Content after the header must be within 50,000 bytes
+        content_part = tail_block.split("\n", 1)[1]
+        assert len(content_part.encode("utf-8")) <= 50_000
 
-        # Line cap check: at most 50 log lines
-        log_lines = tail_block.splitlines()
-        # First line is the header 'Remote log tail (last 50 lines):'
-        content_lines = [line for line in log_lines if line.startswith("line-")]
-        assert len(content_lines) <= 50
-        # The newest line must be present (line-099)
-        assert any("line-099" in line for line in content_lines)
-        # Older lines (e.g. line-000) must be trimmed
-        assert not any("line-000" in line for line in content_lines)
+        # Newest line is kept
+        assert "newest line:" in tail_block
+        # Oldest line is trimmed away by byte cap
+        assert "oldest line:" not in tail_block
 
     def test_successful_run_prints_no_log_tail(
         self, tmp_path: Path, monkeypatch
@@ -262,11 +347,8 @@ class TestLambdaLogTailOnFailure:
 
         assert rc == 0
         assert len(terminations) == 1
-        # No tail command sent
         assert not any(cmd[0] == "ssh" and "tail" in cmd[-1] for cmd in commands)
-        # SCP was run
         assert any(cmd[0] == "scp" for cmd in commands)
-        # No log tail or fetch notice printed
         assert not any("Remote log tail" in p for p in prints)
         assert not any("Could not fetch remote log tail" in p for p in prints)
         assert any("Training completed" in p for p in prints)
