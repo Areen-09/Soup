@@ -3,7 +3,8 @@
 Verifies that the rendered Lambda controller:
 1. Embeds output redirection via tee under pipefail in user_data.
 2. Captures remote log tail over SSH when remote training exits with non-zero status.
-3. Passes short timeout and utf-8 replace encoding to subprocess.run.
+3. Passes short timeout, capture_output=True, check=False, and utf-8 replace encoding
+   to subprocess.run.
 4. Prints the log tail strictly before verifying instance termination.
 5. Proceeds with instance termination even if the log tail fetch fails, times out, or errors.
 6. Leaves the controller exit status unchanged on fetch errors (rc == 1).
@@ -12,7 +13,8 @@ Verifies that the rendered Lambda controller:
    failure details at 200 characters.
 8. Enforces line cap (at most 50 lines) independently of byte cap.
 9. Enforces byte cap (at most 50 KB) independently of line cap.
-10. Prints no log tail on successful runs (exit 0).
+10. Handles multi-byte characters split across the 50 KB byte-cap boundary without decode error.
+11. Prints no log tail on successful runs (exit 0).
 """
 
 from __future__ import annotations
@@ -133,6 +135,8 @@ class TestLambdaLogTailOnFailure:
         assert tail_kw.get("timeout") == 15
         assert tail_kw.get("encoding") == "utf-8"
         assert tail_kw.get("errors") == "replace"
+        assert tail_kw.get("capture_output") is True
+        assert tail_kw.get("check") is False
 
         # Derive expected log path from user_data so the tee destination and tail path cannot drift
         namespace: dict[str, object] = {}
@@ -141,7 +145,25 @@ class TestLambdaLogTailOnFailure:
         match = re.search(r"\|\s*tee\s+(\S+)", user_data)
         assert match is not None
         tee_path = match.group(1)
-        assert tail_argv[-1] == f"tail -n 50 {tee_path}"
+
+        key_path = str(tmp_path / "lambda-key")
+        assert tail_argv == [
+            "ssh",
+            "-i",
+            key_path,
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "StrictHostKeyChecking=accept-new",
+            "-o",
+            "ConnectTimeout=15",
+            "-o",
+            "ServerAliveInterval=30",
+            "-o",
+            "ServerAliveCountMax=6",
+            "ubuntu@192.0.2.1",
+            f"tail -n 50 {tee_path}",
+        ]
 
         # Verify log tail is in printed output
         assert any("FileNotFoundError: data.jsonl not found" in p for p in prints)
@@ -338,6 +360,44 @@ class TestLambdaLogTailOnFailure:
         assert "newest line:" in tail_block
         # Oldest line is trimmed away by byte cap
         assert "oldest line:" not in tail_block
+
+    def test_log_tail_byte_cut_splits_multibyte_utf8_char_without_decode_error(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        stub = _setup_env(tmp_path, monkeypatch)
+        prints: list[str] = []
+
+        # 3-byte UTF-8 character (Euro sign €: b'\xe2\x82\xac') placed so the
+        # 50,000-byte tail cut slices into it, leaving an orphan continuation byte at index 0.
+        prefix = "start of remote log\n"
+        char_3b = "\u20ac"  # 3 bytes: \xe2 \x82 \xac
+
+        # Suffix of 49,999 bytes: the cut at -50,000 bytes lands on char_3b's 3rd byte (0xac).
+        final_marker = "UniqueFatalError: out of bounds\n"
+        padding = "z" * (49_999 - len(final_marker.encode("utf-8")))
+        suffix = padding + final_marker
+
+        raw_log = prefix + char_3b + suffix
+
+        encoded = raw_log.encode("utf-8")
+        assert len(encoded) > 50_000
+        cut = encoded[-50_000:]
+        assert len(cut) == 50_000
+        assert cut[0] == 0xAC  # UTF-8 continuation byte
+
+        def fake_run(argv, **kw):
+            if argv[0] == "ssh":
+                if "tail" in argv[-1]:
+                    return subprocess.CompletedProcess(argv, 0, raw_log, "")
+                return subprocess.CompletedProcess(argv, 0, "status: error\n1\n", "")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        rc, _ = _exec(stub, fake_run, captured_prints=prints)
+        assert rc == 1
+
+        tail_block = next(p for p in prints if "Remote log tail" in p)
+        assert "UniqueFatalError: out of bounds" in tail_block
+        assert not any("Could not fetch remote log tail" in p for p in prints)
 
     def test_successful_run_prints_no_log_tail(
         self, tmp_path: Path, monkeypatch
