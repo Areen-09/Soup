@@ -17,6 +17,7 @@ Verifies that the rendered Lambda controller:
 
 from __future__ import annotations
 
+import re
 import subprocess
 import types
 from pathlib import Path
@@ -103,7 +104,7 @@ class TestLambdaLogTailOnFailure:
     ) -> None:
         stub = _setup_env(tmp_path, monkeypatch)
         prints: list[str] = []
-        tail_kwargs: list[dict] = []
+        tail_calls: list[tuple[list[str], dict]] = []
 
         sample_tail = (
             "Traceback (most recent call last):\n"
@@ -115,7 +116,7 @@ class TestLambdaLogTailOnFailure:
             if argv[0] == "ssh":
                 cmd_str = argv[-1]
                 if "tail" in cmd_str:
-                    tail_kwargs.append(kw)
+                    tail_calls.append((argv, kw))
                     return subprocess.CompletedProcess(argv, 0, sample_tail, "")
                 return subprocess.CompletedProcess(argv, 0, "status: error\n1\n", "")
             return subprocess.CompletedProcess(argv, 0, "", "")
@@ -127,10 +128,20 @@ class TestLambdaLogTailOnFailure:
         assert terminations[0][2] == {"instance_ids": ["instance-1"]}
 
         # Verify tail command arguments & options
-        assert len(tail_kwargs) == 1
-        assert tail_kwargs[0].get("timeout") == 15
-        assert tail_kwargs[0].get("encoding") == "utf-8"
-        assert tail_kwargs[0].get("errors") == "replace"
+        assert len(tail_calls) == 1
+        tail_argv, tail_kw = tail_calls[0]
+        assert tail_kw.get("timeout") == 15
+        assert tail_kw.get("encoding") == "utf-8"
+        assert tail_kw.get("errors") == "replace"
+
+        # Derive expected log path from user_data so the tee destination and tail path cannot drift
+        namespace: dict[str, object] = {}
+        exec(stub, namespace)
+        user_data = str(namespace["_USER_DATA"])
+        match = re.search(r"\|\s*tee\s+(\S+)", user_data)
+        assert match is not None
+        tee_path = match.group(1)
+        assert tail_argv[-1] == f"tail -n 50 {tee_path}"
 
         # Verify log tail is in printed output
         assert any("FileNotFoundError: data.jsonl not found" in p for p in prints)
