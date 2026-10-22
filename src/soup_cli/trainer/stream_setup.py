@@ -889,7 +889,9 @@ class StreamingSetupMixin:
         from dataclasses import replace
 
         from peft import TaskType
-        from transformers import AutoConfig, AutoTokenizer
+        from transformers import AutoTokenizer
+
+        from soup_cli.utils.kimi_k2 import load_stream_model_config
 
         # BEFORE the tokenizer load, the weight resolve and the shard write:
         # this configuration cannot work, and finding out minutes into disk I/O
@@ -897,7 +899,7 @@ class StreamingSetupMixin:
         refuse_if_data_parallel(self.device)
 
         from soup_cli.utils.expert_stream import EXPERT_LAYOUT_PER_EXPERT
-        from soup_cli.utils.fp8_block import fp8_block_size
+        from soup_cli.utils.fp8_block import check_source_quantization, quantization_config_of
         from soup_cli.utils.layer_shard import (
             PER_EXPERT_LAYOUT_ARCHS,
             QUANT_NF4,
@@ -945,20 +947,37 @@ class StreamingSetupMixin:
         from soup_cli.utils.stripe_roots import resolve_stripe_roots
         from soup_cli.utils.terminal import for_terminal
 
-        console.print(f"[dim]Loading tokenizer: {cfg.base}[/]")
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            cfg.base, trust_remote_code=self._trust_remote_code,
-            **base_revision_kwargs(cfg.base),
-        )
-        if self.tokenizer.pad_token is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
-
         # The streamed decoder is always transformers' own class (see
-        # _STREAM_NATIVE_MODEL_CODE); trust_remote_code reaches the tokenizer only.
-        model_config = AutoConfig.from_pretrained(
+        # _STREAM_NATIVE_MODEL_CODE); trust_remote_code reaches the tokenizer only. A Kimi K2
+        # config (model_type kimi_k2: custom code to AutoConfig) loads into the native
+        # DeepseekV3Config behind a guard that refuses by name what that class would compute
+        # differently (utils/kimi_k2.py). Before the tokenizer: a refused K2 is told so first,
+        # not sent to install the tokenizer's requirements.
+        model_config = load_stream_model_config(
             cfg.base, trust_remote_code=self._STREAM_NATIVE_MODEL_CODE,
             **base_revision_kwargs(cfg.base),
         )
+
+        console.print(f"[dim]Loading tokenizer: {cfg.base}[/]")
+        try:
+            # config=: without it AutoTokenizer reads the config again, with the user's
+            # trust_remote_code, and for a repository with an auto_map (Kimi K2, Moonlight)
+            # imports and runs its configuration module (second review of #2107). The
+            # native config is what the tokenizer is resolved against; the flag still
+            # reaches the tokenizer's own code (K2's tokenization_kimi.py).
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                cfg.base, config=model_config, trust_remote_code=self._trust_remote_code,
+                **base_revision_kwargs(cfg.base),
+            )
+        except Exception:
+            # Kimi K2's tokenizer is repository code that imports tiktoken: say so by name.
+            from soup_cli.utils.kimi_k2 import print_kimi_k2_tokenizer_hint
+
+            print_kimi_k2_tokenizer_hint(cfg.base, console, **base_revision_kwargs(cfg.base))
+            raise
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+
         # Allowlist, not a heuristic — a half-supported architecture streams
         # weights into the wrong module and mis-trains silently.
         arch = stream_arch_of(model_config)
@@ -977,12 +996,14 @@ class StreamingSetupMixin:
                 f"base streams as {arch!r}. Use stream_expert_layout='fused'."
             )
         # An FP8 block-quantised base (DeepSeek-V3's published format) is dequantised by
-        # the sharder. A spelling it does not dequantise, or an FP8 base on another
-        # architecture, is refused here from the config alone: before any weight is
+        # the sharder. A spelling it does not dequantise, an FP8 base on another
+        # architecture, or any other declared quantiser (compressed-tensors, GPTQ, AWQ,
+        # bitsandbytes, ...) is refused here from the config alone: before any weight is
         # resolved or downloaded. The disk pre-flight sizes the cache from the same
         # config (the shards hold dequantised weights, the scales are not stored).
-        source_quantization = getattr(model_config, "quantization_config", None)
-        fp8_block = fp8_block_size(source_quantization, arch=arch)
+        # The top-level declaration, or a multimodal wrapper's text_config one.
+        source_quantization = quantization_config_of(model_config)
+        fp8_block = check_source_quantization(source_quantization, arch=arch)
 
         on_cuda = str(self.device).startswith("cuda")
         # #385 — ASK THE CARD. bf16 needs Ampere, and a T4 (Colab free), a P100

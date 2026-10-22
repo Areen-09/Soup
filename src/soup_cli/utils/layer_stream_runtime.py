@@ -2560,9 +2560,11 @@ def build_meta_skeleton(
     views land in modules that know how to consume them.
     """
     from accelerate import init_empty_weights
-    from transformers import AutoConfig, AutoModelForCausalLM
+    from transformers import AutoModelForCausalLM
 
+    from soup_cli.utils.kimi_k2 import load_stream_model_config
     from soup_cli.utils.layer_shard import QUANT_NF4, SUPPORTED_STREAM_QUANTS
+    from soup_cli.utils.run_provenance import base_revision_kwargs
 
     if quant not in SUPPORTED_STREAM_QUANTS:
         raise ValueError(
@@ -2570,7 +2572,11 @@ def build_meta_skeleton(
             f"{', '.join(SUPPORTED_STREAM_QUANTS)}"
         )
     torch_dtype = _torch_dtype(dtype)
-    config = AutoConfig.from_pretrained(model_id, trust_remote_code=trust_remote_code)
+    # AutoConfig's config, or for Kimi K2 the guarded native one (utils/kimi_k2.py); both
+    # reads pinned to the run's bound base commit (#2094).
+    config = load_stream_model_config(
+        model_id, trust_remote_code=trust_remote_code, **base_revision_kwargs(model_id),
+    )
     config.use_cache = False
     _drop_fp8_source_quantization(config)
     quant_config = None

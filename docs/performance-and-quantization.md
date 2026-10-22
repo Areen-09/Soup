@@ -468,6 +468,8 @@ code. For example, Moonlight-16B-A3B needs that flag for its tokenizer while its
 expert shards. Streaming requires a supported native model implementation; the
 flag does not enable custom model code on this path. The dated Moonlight hardware
 runs are recorded in the [probe report](../benchmarks/probe-rtx5070-moonlight-16b.md).
+A Kimi K2 base is read the same way, through a guarded rewrite of its `config.json`
+(see "Kimi K2" below).
 
 **How it works.** LoRA adapters + their gradients + optimizer state stay resident in VRAM (they are small). The frozen base lives in CPU RAM, page-locked when the machine allows it, and is streamed: each decoder layer is copied into one of two pre-allocated VRAM buffers on a dedicated CUDA stream while the previous layer is still computing, so the load overlaps the compute. Vocabulary-sized `embed_tokens` and an untied `lm_head` use one additional shared slot: the embedding is loaded for the model input, then the same allocation is reused for the output head, whose copy is issued right after the embedding lookup (`StreamPrefetcher.head_prefetch_layer`, default `0`) rather than at the last decoder layer, and the embedding is reloaded into it at the tail of that step's backward pass so the copy overlaps the remaining compute instead of blocking the next step's first lookup. Each decoder layer is read **twice** per step — once in the forward pass and once when the backward pass recomputes it — because `dL/dx = Wᵀ · dL/dy` needs the weights to reach the layers below. That is physics, not an implementation detail, and it is why streaming costs time.
 
@@ -504,7 +506,7 @@ What the VRAM pre-flight counts:
 What the disk pre-flight counts: the cache the sharder will write in the layout you chose, sized from the source safetensors headers (see "Disk pre-flight and shard cache" below). Under `quantization: 4bit` that is the experts at NF4 here and at the stream dtype with `fused`: for Moonlight it charges 9.24 GB here and 30.60 GB fused, within 0.01% of the caches the sharder then wrote. (Before, it charged the NF4 rate to every parameter, 8.23 GB in both layouts, so a fused run could pass the check and fill the disk mid-shard.)
 
 Limits and refusals:
-- **Architecture.** Only `model_type: deepseek_v3` is admitted. Any other base is refused before weights are resolved.
+- **Architecture.** Only `model_type: deepseek_v3` is admitted, which includes a Kimi K2 base that passes the guard in "Kimi K2" below (it streams as `deepseek_v3`). Any other base is refused before weights are resolved.
 - **Adapters on routed experts.** `moe_lora` is refused with this layout, because a streamed expert has nowhere to keep an adapter between its visits. Adapt attention or the shared expert instead.
 - **Older Soup versions.** A Soup from before this layout accepts a per-expert cache as reusable and then fails at install ("shard is missing decoder weights"). Delete the cache directory, or re-shard with `fused`, before going back to an older version.
 
@@ -530,11 +532,40 @@ Measured:
 - **A real checkpoint, CPU only.** Moonlight-16B-A3B, converted to this format, sharded in 93 s (27 layers, NF4, `fused`). The 30.60 GB cache came within 0.0002% of the pre-flight's figure (0.000115%: 35,336 bytes), and every FP8-derived tensor checked in three layers equals an independent dequantisation of the source. A GPU `soup train` comparison against the bf16 source is recorded in [`probe-rtx5070-moonlight-fp8-source.md`](../benchmarks/probe-rtx5070-moonlight-fp8-source.md) (pre-registered verdict FAIL on per-step loss and step time; see the record).
 
 Limits and refusals:
-- **Architecture.** Only `model_type: deepseek_v3` is admitted. A Kimi K2 checkpoint declares `model_type: kimi_k2` and is still refused by name, FP8 or not.
+- **Architecture.** Only bases that stream as `model_type: deepseek_v3` are admitted: DeepSeek-V3 itself, and a Kimi K2 base (`model_type: kimi_k2`) whose config passes the guard in "Kimi K2" below.
 - **Other FP8 formats.** Each of these is refused, and the message names the supported format: per-tensor scales, `e5m2` weights, `compressed-tensors`, ue8m0 (power-of-two) scales, static activation scales, a missing or misshapen scale, an FP8 tensor without a scale, and a scale without its tensor. A `weight_block_size` axis outside [1, 1048576] is refused too. A spelling the config already gives away is refused at setup, before any weight is resolved or downloaded; the rest before the first byte of the cache is written.
+- **Integer and packed formats.** Kimi-K2-Thinking's compressed-tensors `pack-quantized` INT4 (int32 `weight_packed`, `weight_scale`, int64 `weight_shape`) is not dequantised, and nor is any other integer quantiser; see the refusal list below.
 - **Damaged values.** A weight that is NaN after dequantisation (the e4m3fn bytes 0x7F and 0xFF), a negative scale, a non-finite scale, and a weight past float16's range under a float16 stream (pre-Ampere cards; stream it in bfloat16) are refused, naming the tensor, when that tensor is read: before the cache index is written, though files of earlier layers may already be on disk (no index names them, so they are never used, and the next run shards again). A zero scale, as an all-zero block has, is kept.
 - **Cache identity.** For `deepseek_v3`, `config.json` is part of the cache's source identity, as are the weight files, so a cache sharded from the bf16 checkpoint is never reused for its FP8 copy at the same path, nor the reverse.
 - **After training.** The adapter is trained against the dequantised weights. Merging it or serving it loads the base through transformers' own FP8 path, which is a different numerical path from the one the adapter was trained on.
+
+**Kimi K2 (`model_type: kimi_k2`).** Kimi-K2-Base and Kimi-K2-Instruct are DeepSeek-V3's decoder (MLA attention, 384 routed experts plus a shared one, 61 layers, about 1T parameters) in DeepSeek-V3's FP8 block format, but their `config.json` declares `model_type: kimi_k2` and an `auto_map` onto the repository's own code. transformers registers no `kimi_k2` config, and layer streaming never runs a repository's model code, so such a base used to fail with transformers' "contains custom code" error before the architecture list was even checked. Layer streaming (Soup's layer-to-layer streaming of a frozen base, L2L: Pudipeddi et al. 2020) now reads that `config.json` as plain data into transformers' own `DeepseekV3Config`, with `model_type` set to `deepseek_v3` and `auto_map` dropped (transformers does the same for the text tower of Kimi K2.5), and streams the base as `deepseek_v3`: its FP8 weights are dequantised as described above, both expert layouts are available, and `target_modules: auto` adapts the same MLA projections as on DeepSeek-V3. There is no config key; the rewrite is chosen from `config.json`.
+
+A guard runs first, before the tokenizer is loaded. It admits the config only where transformers' class computes what K2's own `modeling_deepseek.py` computes, and otherwise refuses before any weight is resolved, naming every field that differs and its value:
+- `architectures` exactly `["DeepseekV3ForCausalLM"]`, `topk_method: noaux_tc` and `scoring_func: sigmoid` (the only router K2's code implements, and the one transformers always runs);
+- `n_group: 1` and `topk_group: 1`: K2 masks the expert groups it does not pick with 0.0 and transformers with -inf, which can pick different experts; with one group nothing is masked;
+- `num_experts_per_tok` of at least 2 while `norm_topk_prob` is on: K2 renormalises the top-k weights only above one expert;
+- `moe_layer_freq` 1, integer `n_routed_experts` and `n_shared_experts`, and `num_key_value_heads` equal to `num_attention_heads`: K2's attention ignores it, while transformers divides by it and defaults it to 128;
+- every top-level field of the published Base / Instruct `config.json` present, except `auto_map` and `quantization_config`, which may be left out (`torch_dtype` may be spelled `dtype`). A missing field is not read by any row above, and transformers' class would compute with its own default for it: `rope_theta` 10000.0 where K2 publishes 50000.0, `routed_scaling_factor` 2.5 where K2 publishes 2.827;
+- no top-level field outside the published Base / Instruct `config.json` except three metadata keys (`_commit_hash`, which transformers' reader adds; `_name_or_path`; `dtype`). transformers' class can read a field K2's code ignores, such as `head_dim`, `partial_rotary_factor`, a transformers-5 `rope_parameters`, `ep_size` or `rope_interleave`, and then compute differently or crash, so any such field is refused by name;
+- `rope_scaling` null, or yarn holding only the keys K2's yarn reads, with `factor` and `original_max_position_embeddings` set, no zero `beta_fast` or `beta_slow`, and an `mscale` consistent with `mscale_all_dim`: otherwise the two compute different rotary frequencies or attention factors;
+- `quantization_config` absent, or DeepSeek-V3's block FP8 as above.
+
+Kimi-K2-Base and -Instruct as published pass it. Other K2 releases are out of scope for now, and the refusal says so before it lists the fields. Kimi-K2-Thinking does not pass: its weights are compressed-tensors INT4, refused as `quantization_config.quant_method='compressed-tensors'`, and its file carries 50 more fields the published one does not, each named. Kimi-K2-Instruct-0905 has the same decoder, but its file adds `ep_size`, `pad_token_id` and the serialised `PretrainedConfig` defaults, so it is refused too. Kimi K2.5 and K2.6 (`model_type: kimi_k25`, a vision-language wrapper) are not admitted either.
+
+**The K2 tokenizer.** It exists only as code in the repository (`tokenization_kimi.py`), so a K2 run needs `--trust-remote-code`, and Soup prints its REMOTE CODE WARNING panel for it. Under layer streaming that flag reaches the tokenizer only; the config and the model are transformers' own classes. The tokenizer load is handed the config Soup already loaded, so `AutoTokenizer` does not read the config again with the flag (it would import and run the repository's `configuration_deepseek.py`; Moonlight-16B's tokenizer load did that before this change). The tokenizer also imports `tiktoken`, which Soup does not install: `pip install tiktoken`. When the tokenizer fails to load on a K2 base, Soup names both requirements before the error.
+
+Measured ([gate](../benchmarks/gate-kimi-k2-admission.md), CPU only):
+- **Config.** The published Base and Instruct `config.json` load into `DeepseekV3Config`. The gate's field-by-field check fails as registered on one of 43 fields, `rope_scaling`: transformers adds `rope_theta` and `rope_type` to it, as it does for any DeepSeek-V3 config, and every value K2 declares is kept. The result equals what `AutoConfig` builds from the same file spelled `deepseek_v3`.
+- **Numerics.** On a tiny K2-like checkpoint (its `config.json` the published one with tiny dimensions: `kimi_k2`, `auto_map`, one expert group, yarn), the streamed model matches a resident `DeepseekV3ForCausalLM` on the same weights bit for bit, in its logits, loss and LoRA gradients, in both expert layouts, from a bf16 checkpoint and from its FP8 block copy.
+- **The real index.** A header map rebuilt from the published Base index (no weights downloaded) has its 139,644 tensors and its exact byte total, 1,029,173,256,720 B. Over it, the disk pre-flight sizes each layer of the cache exactly as an independent count from the shapes does: under `quantization: 4bit` (bf16), **533.2 GB** with `per_expert` (533,246,633,930 B, of which the RAM tier holds 9.8 GB) and **2.04 TB** `fused` (2,039,152,160,406 B), 3.8x larger because the fused routed experts stay bf16.
+
+Not measured:
+- No K2 weights were downloaded, nothing was trained on K2, and no GPU ran. The cache sizes above are the pre-flight's arithmetic, not a cache written to disk.
+- **A brief 22.5 GB CPU allocation per MoE layer.** On a full-size K2, transformers' `DeepseekV3NaiveMoe` allocates its fused experts with `torch.empty(384, 4096, 7168)` in bf16 on the CPU, about 22.5 GB of commit, before accelerate moves them to meta. This happens in the setup's NF4 / `moe_lora` probe and in `build_streamed_model`. RSS barely moves, but the commit charge needs that headroom, and a box short of it fails with a raw `DefaultCPUAllocator` error. DeepSeek-V3 had the same before this change, at about 15 GB.
+- Parity with K2's own code: Soup never executes it. Read as text, it would not import under transformers 5.17: it imports `is_torch_fx_available`, which 5.17 does not define. That is an inference from reading the code, not an observed error. Its router asserts it is not training and its MoE block fails in training mode, so it is inference-only anyway; transformers' class is the training path. The guard was derived by reading it, and its numeric rows were checked against a hand transcription of its router and yarn.
+- Known numeric differences from K2's own code that remain: the MoE combine (K2 sums the weighted expert outputs in fp32 and rounds once; transformers rounds each weighted output to the model dtype before accumulating, which is bf16 rounding noise), eager versus sdpa attention, and the router bias kept as a float32 buffer rather than a Parameter (float32 in the checkpoint either way).
+- The checkpoint carries 61 stale `self_attn.rotary_emb.inv_freq` tensors. The sharder writes them into the layer files as stored, and nothing streams or reads them: K2's code keeps that buffer non-persistent, and transformers computes the rope from the config.
 
 **`stream_nf4_scale_cache` (opt-in).** On the dequantise + `F.linear` path, a
 double-quantised NF4 weight expands its 8-bit block scales to fp32 on every visit,
@@ -722,6 +753,8 @@ The same term decides what an 8B base needs on a 4 GB card. Llama-3.1-8B NF4 (vo
 further 512 tokens per step** — 4.512 GB at 1024, already above the 4.294 GB card
 ([probe v0.73.0, section 9](../benchmarks/probe-v0.73.0-what-bounds-streaming.md#9-peak-vram-and-the-microbatch-sweep)).
 `data.max_length` defaults to 2048, so the "8B on 4 GB" setup needs `data.max_length: 512`.
+`training.stream_loss_chunk` (below) is built to stop the logits term growing with the length; no chunked
+run of that setup has been measured.
 
 So `soup train` predicts peak VRAM before building the model, and **refuses a run it
 expects not to fit**:
@@ -750,6 +783,73 @@ BF16 support and `float16` otherwise — and is printed with the SM clock it was
 because this card alone produced 3.5 and 7.6 TFLOPS in two sessions at the same reported
 clock. A per-card constant compiled into Soup would be a fabrication. Real streamed runs landed at
 68–100% of their measured ceiling.
+
+**Long contexts: the head and the loss in chunks (`training.stream_loss_chunk`, #1693).**
+The logits term is `vocab × seq × batch`, so it is what caps the context length on a small
+card. `training.stream_loss_chunk: 128` runs the output head and the loss 128 tokens at a
+time: each chunk runs the head, takes its cross-entropy and the gradient on its own slice of
+the hidden states, and drops its logits before the next chunk starts. The logits term the
+pre-flight charges becomes `vocab × min(seq, chunk) × batch`. By the pre-flight's own
+arithmetic (the shipped 14 bytes per element, the 128 256-token vocabulary above, batch 1)
+that is an estimated 0.23 GB at a chunk of 128 whatever `data.max_length` is, against
+0.92 GB at 512 tokens, 1.84 GB at 1024 and 3.68 GB at 2048 unchunked. These are estimates,
+not measurements: no run with the option has been measured on a GPU (see the end of this
+section). The option takes an explicit number of tokens from 16 to 8192; there is no default
+and no `true`, and unset is off.
+
+**What it costs.** Two `[batch, seq, hidden]` tensors in the stream dtype, which the
+pre-flight adds to its estimate: the gradient on the hidden states, filled chunk by chunk in
+the forward and handed to the backward, and its product with the incoming gradient. At
+2048 tokens, hidden 4096 and bf16 that charge is 34 MB for the two. They are not live at the
+same time as a chunk's logits, so charging both beside the logits term errs high. And a loop
+over the head, one matmul per chunk instead of one over the sequence; what that does to speed
+has not been measured.
+
+**What it gives up.**
+
+- `outputs.logits` on a labelled forward: the output carries the loss and no logits. The
+  trainer's `entropy`, `mean_token_accuracy` and `num_tokens` columns and the rewind log's
+  per-row losses (`rewind.jsonl`) are written as before, under the same names, from what the
+  chunk loop collects. A forward without labels (generation, `predict`) is unchanged; a
+  labelled forward without gradients (the eval loss) is chunked too.
+- Equality to the last bit with an unchunked step. The per-token terms are the ones
+  `ForCausalLMLoss` computes; the order of the final sum and the shape of each matmul are
+  not. `tests/test_stream_loss_chunk.py` holds the loss, the gradients, the logged columns
+  and the rewind log's losses to a relative `1e-5` of the same run unchunked, on a tiny
+  Llama. The bit-exactness the streamed path is published with does not extend to a run with
+  this option.
+- A trainable output head: the gradient is taken on the hidden states only.
+
+**The pre-flight** charges the logits on `min(seq, chunk)` tokens at the shipped bytes per
+element, plus the two tensors above; the panel line ends
+`(logits 0.23 GB in chunks of 128 tokens)` at batch 1 with the vocabulary above. That charge
+is arithmetic. Of the 14 bytes per element, 12 are the loss arithmetic measured on
+unchunked steps and 2 are charged for a retained copy of the logits whose cause is not
+identified (#327); whether a chunked step still pays those 2 is not known. The hook is on the model before `stream_vram_probe` runs, so with
+`stream_vram_probe: true` the step that decides the fit is the chunked one.
+
+**Refused.** At config load, as listed under "Rejected at config load" below: without
+`stream_layers`, for a task other than `sft`, with `data.format: raft`, and beside
+`use_cut_ce`. When the model is built, with the reason: a trainable output head, a model
+without one, and a model that changes its logits after the head: Gemma 2's
+`final_logit_softcapping` is read from its config, and any other such model is caught at its
+first labelled forward.
+
+**Not measured yet.** #1693 asks for peak VRAM at 512, 1024 and 2048 tokens with and without
+the option, on one model and stack, and for a pre-flight that does not under-predict on those
+rows. That table needs a CUDA card and is left for whoever has one. To produce it:
+
+```bash
+python benchmarks/harness/stream_loss_chunk_vram.py --base <id-or-path> --quantization 4bit
+```
+
+The harness runs the setup `soup train` uses and one step per arm at batch 1 (`--seqs` and
+`--chunk` change the lengths and the chunk, 512,1024,2048 and 128 by default) and prints one
+row per length and arm: the pre-flight's prediction for that run, the free VRAM it compared
+against, and `torch.cuda.max_memory_allocated()` over the step. An arm that runs out of
+memory is a row, not a crash. It exits 1 when a row under-predicts, including an arm that ran
+out of memory inside the predicted fit. `--self-test` runs the same protocol on a tiny local
+Llama with no GPU and no download, and reads no peak.
 
 ### Batch size vs gradient accumulation
 
@@ -788,6 +888,12 @@ prints this advice when it sees you accumulating.
 - `stream_source` / `stream_ngram_source` / `stream_buffers` / `stream_read_ahead` / `stream_vram_override` / `stream_vram_probe` / `stream_nf4_scale_cache` / `stream_expert_layout` / `stream_disk_kind` / `stream_pin` / `stream_loss_chunk` set while `stream_layers: false` → a footgun, refused
 - `stream_expert_layout: per_expert` with `moe_lora` → refused: a routed expert streamed one at a time has nowhere to keep an adapter. On a base that is not `model_type: deepseek_v3` → refused at setup, before the weights are resolved
 - an FP8 checkpoint in any format other than DeepSeek-V3's block FP8, or an FP8 base that is not `model_type: deepseek_v3` → refused naming the supported format: at setup when `config.json` gives it away, otherwise before the cache is written. The block format itself is dequantised at shard time (see "FP8 block-quantised bases" above)
+- any other quantised checkpoint → refused by name, before a byte of the cache is written, and in the same words by the sharder, the disk pre-flight and the setup. The sharder checks the source first, from its `config.json` and headers, so a refusal creates no cache folder, leaves an existing cache and its `index.json` untouched, and never reuses a cache an older Soup sharded from such a source. Layer streaming reads plain floating-point weights, DeepSeek-V3's block FP8 and, on qwen4_exp only, oMLX/oQ affine bundles; the message says which format it found, that layer streaming cannot dequantise it, and to point `training.base` at a bf16 or FP8-block copy. Refused:
+  - a `config.json` `quantization_config` whose `quant_method` is not `fp8`: `compressed-tensors` in any format (Kimi-K2-Thinking's `pack-quantized` INT4 among them), `gptq`, `awq`, `bitsandbytes` (or `load_in_4bit` / `load_in_8bit` with no method), `hqq`, `aqlm`, `eetq`, `torchao`, `quanto`, `fbgemm_fp8`, `mxfp4`, `mxfp8`, `nvfp4`, `gguf` and every other quantiser transformers registers, or a name it does not. Also read from `text_config` when the top level has none, and a value that is not a mapping (a string, a list, a number) is refused as malformed. `quant_method` is matched exactly, as transformers matches it: `FP8` is not `fp8`. Refused at setup, before any weight is resolved or downloaded. A config with no `quant_method` (the oMLX/oQ spelling, `bits` and `group_size` only) is decided by its tensors;
+  - a tensor stored as an integer or packed type (I8, I16, I32, I64, U8, U16, U32, U64, BOOL, F4), which a plain read would cast to floats and train on: GPTQ/AWQ `qweight`, compressed-tensors `weight_packed`, bitsandbytes uint8 and int8 weights, oMLX/oQ uint32 words on an architecture other than qwen4_exp;
+  - a floating-point tensor named like a quantiser's companion: `weight_scale` (compressed-tensors; DeepSeek-V3's block FP8 spells its scale `weight_scale_inv`), `weight_global_scale`, `weight_zero_point`, `input_scale`, `qzeros`, `g_idx`, `SCB`, `absmax`, `quant_map`, `W_q`, `codebooks` and the like.
+
+  Not refused: the integer buffers a supported model really carries, which are qwen4_exp's PLE n-gram hashing tables (`layer_multipliers`, `ngram_heads_vocab_sizes`, `ngram_heads_offsets`, int64; the runtime keeps the skeleton's own values) and `position_ids`. The supported families' own checkpoints carry no other integer tensor (pinned by a tiny checkpoint of each in `tests/test_stream_refuses_packed_quant.py`). Dequantise any other source to bf16 first
 - `stream_nf4_scale_cache` without `quantization: 4bit` and double quantization → refused: there are no nested NF4 scales to cache
 - a non-default `stream_read_ahead` beside `stream_source: ram` → refused. The read-ahead reader belongs to the NVMe disk tier and `ram` never falls back to it, so the setting would validate, be documented, and reach nothing. The default is accepted, because a default is not a decision
 - a disk-tier run whose host staging (`stream_read_ahead` layers, plus one slot each for the embedding and an untied `lm_head`) plus the resident extras will not fit the free-RAM headroom → refused by name, naming the depth to lower. Refused rather than clamped: a depth you set is a decision, and silently lowering it would hand back a slower run than the one you configured
@@ -795,7 +901,8 @@ prints this advice when it sees you accumulating.
 - `stream_vram_probe` on any task other than `sft` → the probe runs a plain causal-LM step, which *is* the SFT step but is not a preference loss. Measured at one matching shape it is conservative there too (6.02 GB against a real DPO step's 5.30 GB, +13.5%), but one shape is not a validation, so it is not offered for `dpo`/`orpo`/`simpo`/`kto` yet
 - `stream_loss_chunk` on any task other than `sft`, or with `data.format: raft` → the chunked step rebuilds the causal-LM cross-entropy and returns no logits. A preference loss reduces the logits to per-token log-probs instead, and RAFT's weighted loss reads all of them (#1693)
 - `stream_loss_chunk` beside `use_cut_ce` → each replaces how the loss over the logits is computed. Refused before the `use_cut_ce` refusal above, with a message that names both fields (#1693)
-- an architecture outside the supported list (llama / qwen2 / qwen3, including qwen3_5_moe text aliases / qwen4_exp text / mistral / gemma / gemma2 / gemma3_text / phi / phi3 / deepseek_v3) → named explicitly. `deepseek_v3` is the DeepSeek-V3 family (MLA attention, routed experts plus a shared expert); a Kimi K2 checkpoint uses the same decoder but declares `model_type: kimi_k2`, which transformers does not register, so it is refused under that name. Under `quantization: 4bit` its attention, shared-expert and dense-MLP projections are NF4 while the routed experts stay at the stream dtype: they are 3-D parameters, not `nn.Linear` modules, so a DeepSeek-V3 layer streams most of its bytes unquantised
+- an architecture outside the supported list (llama / qwen2 / qwen3, including qwen3_5_moe text aliases / qwen4_exp text / mistral / gemma / gemma2 / gemma3_text / phi / phi3 / deepseek_v3) → named explicitly. `deepseek_v3` is the DeepSeek-V3 family (MLA attention, routed experts plus a shared expert); a Kimi K2 checkpoint uses the same decoder under `model_type: kimi_k2` and is admitted through the guard in "Kimi K2" above. Under `quantization: 4bit` its attention, shared-expert and dense-MLP projections are NF4 while the routed experts stay at the stream dtype: they are 3-D parameters, not `nn.Linear` modules, so a DeepSeek-V3 layer streams most of its bytes unquantised
+- a Kimi K2 config (`model_type: kimi_k2`) that transformers' DeepSeek-V3 class would compute differently from K2's own code → refused before any weight is resolved, naming every such field and its value (Kimi-K2-Thinking: `quantization_config.quant_method='compressed-tensors'`). The fields, and why each matters, are under "Kimi K2" above
 
 **Config example:**
 
@@ -869,6 +976,7 @@ output: ./output
 - **"layer streaming needs NVMe or more RAM … the detected disk is 'hdd'"** on a fast cloud disk — a virtio device reports `rotational=1` with no media hint. Detection now measures the disk when the flag is unreliable; if it still misreads yours, set `training.stream_disk_kind: nvme` to force the tier on (`ssd`/`hdd` force it off).
 - **"could not page-lock the base … falling back to a PAGEABLE RAM store"** — expected on a busy machine. Training continues, more slowly. Close other applications to keep the pinned store. Since #901 the fallback also prints `after the failed page-lock: cleared the stale CUDA out-of-memory error … and released N GB of page-locked memory it left cached` — a failed page-lock leaves the CUDA runtime holding a stale "out of memory" that the run's first kernel launch would otherwise report as a real one (the report's `AcceleratorError: CUDA error: out of memory` inside `SFTTrainer.__init__`, with gigabytes of VRAM free), and the blocks pinned before the failure stay in torch's host cache until released. Both are handled before the pageable store is built. The store also pins in power-of-two arenas now, so the fallback itself is rarer: a 9.93 GB 14B NF4 store page-locks as 10 GiB where per-tensor pinning asked for ~17 GB.
 - **"layer streaming does not support model_type=…"** — the supported list is llama / qwen2 / qwen3, including `qwen3_5_moe` text aliases / qwen4_exp text / mistral / gemma / gemma2 / gemma3_text / phi / phi3 / deepseek_v3. Multimodal `gemma3` is excluded on purpose; use `gemma3_text`.
+- **"Kimi K2 (model_type 'kimi_k2') streams through transformers' own DeepseekV3 class …"** — your K2 `config.json` sets a field that transformers' class would compute differently from K2's own code, leaves out a published field, or adds one; the message names each one and its value. Kimi-K2-Base and -Instruct as published pass. Other K2 releases (Kimi-K2-Instruct-0905, Kimi-K2-Thinking) are out of scope for now, and Kimi-K2-Thinking's compressed-tensors INT4 is not dequantised by layer streaming.
 - **"predicted peak … exceeds free VRAM" and you believe it is wrong** — lower `batch_size` or `data.max_length` first. Otherwise there are two escape hatches and they are not interchangeable. `training.stream_vram_probe: true` (`sft` only) **measures** one real forward+backward at your configured shape and decides on that, printing the prediction beside it; it costs one step (1–5 s measured) and it can also refuse a run the formula accepted. `training.stream_vram_override: <bytes>` instead **replaces** the free-VRAM figure the check runs against — that is an assertion you are making, not a measurement, so raising it past a real limit is an OOM on Linux and a silent spill on Windows. Prefer the probe when you want to be told the truth; use the override when you know something the driver cannot report.
 - **The prediction is not equally trustworthy at every sequence length.** Measured on a 4 GB RTX 3050 with SmolLM2-135M streamed in bf16 at batch 1, the formula over-predicts by 8% at seq 4352 (safe) and then **under-predicts — 0.934x the real peak at seq 5120 and 0.787x at 6144**. The grid it was fitted on only ever varied batch size, at seq 256 and 512, so long-context streaming is exactly where it has the least evidence behind it. If you are streaming at multi-thousand-token sequences, turn on `stream_vram_probe`. Record: [`benchmarks/gate-v0.73.1-measured-vram-fit.md`](../benchmarks/gate-v0.73.1-measured-vram-fit.md).
 - **The pre-flight reports the whole card on a capped or shared GPU** — `torch.cuda.mem_get_info()` is a device-level driver query and cannot see `set_per_process_memory_fraction`, a MIG slice, or another process on the same card. Set `training.stream_vram_override` to what your process may actually use; the check then refuses configurations that would exceed *that*, which is also how you rehearse a 4 GB card on a 16 GB one.
@@ -1145,6 +1253,8 @@ An unregistered template name is refused by `soup train` and `soup data preproce
 before the model loads, and the message lists the known names.
 
 Raw Jinja strings are validated: null bytes / >64KB / filesystem-touching directives (`{% include %}`, `{% import %}`, `{% from %}`, `{% macro %}`, `{% extends %}`) are rejected at config-load.
+
+`backend: mlx` also refuses `data.chat_template` at config-load — the MLX trainer renders the model's shipped template only, so the override would be silently dropped; `backend: transformers` applies it.
 
 ### OOM-probe auto batch size
 
@@ -1539,12 +1649,6 @@ group_size: 32
 EOF
 soup export --model ./merged --format torchao --quant-config ./q.yaml --output ./out
 
-# AWQ/GPTQ export (deprecated, removed in Soup v0.77) — an explicit local calibration set is required
-soup export --model ./merged --format awq \
-    --calibration-data ./calib.jsonl --output ./out-awq
-soup export --model ./merged --format gptq \
-    --calibration-data ./calib.jsonl --output ./out-gptq
-
 # Unsloth Dynamic 2.0 / IQ / Apple-ARM GGUF via llama.cpp imatrix
 soup export --model ./merged --format gguf-ud \
     --gguf-flavour UD-Q4_K_XL \
@@ -1559,10 +1663,6 @@ soup deploy autopilot --target rtx-4090-24gb \
 ```
 
 Autopilot also detects pre-quantized bases automatically - `TheBloke/Llama-2-7B-Chat-GPTQ` is recommended `gptq` instead of stacking 4-bit on top. Detection runs against the base-model name regex AND any local `config.json`'s `quantization_config.quant_method`. Out-of-cwd model paths are silently skipped (soft-probe semantics). A detected `mxfp4` base is budgeted as the bf16 model it loads (2 bytes per parameter), and Autopilot refuses a `--gpu-budget` below that.
-
-AWQ and GPTQ export are deprecated and will be removed in Soup v0.77: both upstream projects (AutoAWQ and AutoGPTQ) are archived and neither extra can be installed next to `[train]`. Until then `soup export --format awq` and `--format gptq` work as before and start with a `Deprecated:` notice that names the formats to move to (`gguf`, `onnx`, `tensorrt`, `bitnet`, `tq1_0`).
-
-Direct AWQ and GPTQ exports require `--calibration-data`. Soup refuses a missing or unusable JSONL before importing the quantizer or loading the model. This keeps calibration inputs explicit and prevents AutoAWQ from silently downloading its large default dataset. Use `--calibration-samples` to cap the number of usable JSONL rows (default: 128).
 
 The advanced GGUF pipeline uses POSIX `O_NOFOLLOW` to defeat the TOCTOU race between the dispatch-time symlink check and the actual open of the calibration data — a crafted environment cannot race-swap the calibration file between validate and read.
 
