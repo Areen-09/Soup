@@ -746,17 +746,21 @@ or conversational turns (all fields are non-empty message lists with prompt turn
 to `prompt`).
 
 - **Task routing:** `data.format: dpo` feeds `dpo`, `ipo`, `orpo`, `simpo`, `bco`,
-  `preference` and `reward_model`. `data.format: kto` feeds `kto`. `online_dpo`, `grpo`
-  and `ppo` read only the prompt column (`prompt` or `messages`).
-- **Detection:** Automatic format detection requires a `prompt` key. A file without a prompt
-  column (`{"chosen": ..., "rejected": ...}`) fails auto-detection with `Cannot detect format at row 0`;
-  a file with `{"messages": ..., "chosen": ..., "rejected": ...}` detects as `chatml` and drops
-  the answers. Set `data.format: dpo` explicitly to load these layouts.
+  `preference` and `reward_model`. `data.format: kto` feeds `kto`.
+- **Detection:** For the seven preference tasks above, training resolves an omitted
+  `data.format` or `format: auto` to `dpo` (both in live training and under `--dry-run`),
+  so prompt-less preference files load automatically during training. However, the standalone
+  detector and `soup data validate <file>` run without a training task: a prompt-less file
+  (`{"chosen": ..., "rejected": ...}`) fails bare detection with `Cannot detect format at row 0`,
+  and a file with `{"messages": ..., "chosen": ..., "rejected": ...}` detects as `chatml`
+  (losing the answers). Standalone validation of these layouts needs `--format dpo`.
+  Tasks outside those seven get no automatic `dpo` resolution.
 - **Ignored keys:** A top-level `system` key, `scores`, and `ids` are ignored (system instructions
   belong in the conversation message list).
-- **Refusals:** A rejected row is dropped with `Warning: N of M rows dropped: they do not convert as 'dpo'. First: row I: <reason>.`
-  Run `soup data validate <file> --format dpo` to inspect errors (it reports the total count and
-  first three reasons, followed by `... and N more`). If zero usable training rows remain, `soup train`
+- **Refusals:** A refused row is dropped with `Warning: N of M rows dropped: they do not convert as 'dpo'. First: row I: <reason>.`
+  followed by `List them all with: soup data validate <source> --format dpo`.
+  `soup data validate` prints the total drop count and up to the first three reasons,
+  followed by `... and N more`. If zero usable training rows remain, `soup train`
   stops with exit code 1 before loading the model, including under `--dry-run`.
 
 #### Accepted preference pair layouts (`data.format: dpo`)
@@ -769,8 +773,8 @@ to `prompt`).
 | message-list prompt | `{"prompt":[{"role":"user","content":"Q"}],"chosen":[{"role":"assistant","content":"good"}],"rejected":[{"role":"assistant","content":"bad"}]}` | unchanged; a prompt both answers repeat is cut from them |
 | message-list prompt, string answers | `{"prompt":[{"role":"user","content":"Q"}],"chosen":"good","rejected":"bad"}` | each answer becomes one assistant turn |
 | one message object for a list | `{"prompt":"Q","chosen":{"role":"assistant","content":"good"},"rejected":{"role":"assistant","content":"bad"}}` | read as a list of one |
-| no prompt, shared leading turns (needs data.format: dpo) | `{"chosen":[{"role":"user","content":"Q"},{"role":"assistant","content":"good"}],"rejected":[{"role":"user","content":"Q"},{"role":"assistant","content":"bad"}]}` | the shared turns are the prompt |
-| no prompt, messages (needs data.format: dpo) | `{"messages":[{"role":"user","content":"Q"}],"chosen":"good","rejected":"bad"}` | messages is the prompt, answers become assistant turns |
+| no prompt, shared leading turns (format: auto on preference tasks; validate needs --format dpo) | `{"chosen":[{"role":"user","content":"Q"},{"role":"assistant","content":"good"}],"rejected":[{"role":"user","content":"Q"},{"role":"assistant","content":"bad"}]}` | the shared turns are the prompt |
+| no prompt, messages (format: auto on preference tasks; validate needs --format dpo) | `{"messages":[{"role":"user","content":"Q"}],"chosen":"good","rejected":"bad"}` | messages is the prompt, answers become assistant turns |
 | turn with no text | `{"prompt":"Q","chosen":[{"role":"assistant","content":null}],"rejected":[{"role":"assistant","content":"bad"}]}` | content null or absent, with or without tool_calls; a list of content blocks: unchanged |
 | text rows and conversational rows in one file | any two of the above | text rows rewritten as user + assistant turns; Note: N of M train rows are plain-text preference rows in a dataset whose other rows are conversations. Each was rewritten ... |
 

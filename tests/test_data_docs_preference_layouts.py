@@ -136,12 +136,35 @@ B = {"role": "assistant", "content": "bad"}
 G_NULL = {"role": "assistant", "content": None}
 
 
+def check_documented_row_counts(
+    dpo_accepted: list,
+    dpo_refused: list,
+    kto_accepted: list,
+    kto_refused: list,
+    *,
+    min_dpo_accepted: int = 9,
+    min_dpo_refused: int = 11,
+    min_kto_accepted: int = 4,
+    min_kto_refused: int = 4,
+) -> None:
+    """Validate that documented tables maintain at least the required row minimums."""
+    assert len(dpo_accepted) >= min_dpo_accepted, (
+        f"dpo_accepted has {len(dpo_accepted)} rows, expected >= {min_dpo_accepted}"
+    )
+    assert len(dpo_refused) >= min_dpo_refused, (
+        f"dpo_refused has {len(dpo_refused)} rows, expected >= {min_dpo_refused}"
+    )
+    assert len(kto_accepted) >= min_kto_accepted, (
+        f"kto_accepted has {len(kto_accepted)} rows, expected >= {min_kto_accepted}"
+    )
+    assert len(kto_refused) >= min_kto_refused, (
+        f"kto_refused has {len(kto_refused)} rows, expected >= {min_kto_refused}"
+    )
+
+
 def test_preference_layouts_table_row_counts_and_coverage():
     """Assert minimum count and presence of all required documented examples."""
-    assert len(_DPO_ACCEPTED) >= 9, f"Expected >= 9 accepted DPO rows, got {len(_DPO_ACCEPTED)}"
-    assert len(_DPO_REFUSED) >= 11, f"Expected >= 11 refused DPO rows, got {len(_DPO_REFUSED)}"
-    assert len(_KTO_ACCEPTED) >= 4, f"Expected >= 4 accepted KTO rows, got {len(_KTO_ACCEPTED)}"
-    assert len(_KTO_REFUSED) >= 4, f"Expected >= 4 refused KTO rows, got {len(_KTO_REFUSED)}"
+    check_documented_row_counts(_DPO_ACCEPTED, _DPO_REFUSED, _KTO_ACCEPTED, _KTO_REFUSED)
 
     doc_dpo_reasons = {reason for _, reason in _DPO_REFUSED}
     for expected in REQUIRED_DPO_REFUSAL_MESSAGES:
@@ -152,11 +175,55 @@ def test_preference_layouts_table_row_counts_and_coverage():
         assert expected in doc_kto_reasons, f"Required KTO refusal missing from docs: {expected}"
 
 
-def test_deleting_documented_row_fails_count_assertion():
-    """Mutation check from acceptance list: removing a documented row fails count check."""
-    mutated = list(_DPO_REFUSED[:-1])
-    with pytest.raises(AssertionError, match="refused DPO rows"):
-        assert len(mutated) >= 11, f"Expected >= 11 refused DPO rows, got {len(mutated)}"
+@pytest.mark.parametrize(
+    ("name", "kwargs"),
+    [
+        (
+            "dpo_accepted",
+            {
+                "dpo_accepted": _DPO_ACCEPTED[:-1],
+                "dpo_refused": _DPO_REFUSED,
+                "kto_accepted": _KTO_ACCEPTED,
+                "kto_refused": _KTO_REFUSED,
+                "min_dpo_accepted": len(_DPO_ACCEPTED),
+            },
+        ),
+        (
+            "dpo_refused",
+            {
+                "dpo_accepted": _DPO_ACCEPTED,
+                "dpo_refused": _DPO_REFUSED[:-1],
+                "kto_accepted": _KTO_ACCEPTED,
+                "kto_refused": _KTO_REFUSED,
+                "min_dpo_refused": len(_DPO_REFUSED),
+            },
+        ),
+        (
+            "kto_accepted",
+            {
+                "dpo_accepted": _DPO_ACCEPTED,
+                "dpo_refused": _DPO_REFUSED,
+                "kto_accepted": _KTO_ACCEPTED[:-1],
+                "kto_refused": _KTO_REFUSED,
+                "min_kto_accepted": len(_KTO_ACCEPTED),
+            },
+        ),
+        (
+            "kto_refused",
+            {
+                "dpo_accepted": _DPO_ACCEPTED,
+                "dpo_refused": _DPO_REFUSED,
+                "kto_accepted": _KTO_ACCEPTED,
+                "kto_refused": _KTO_REFUSED[:-1],
+                "min_kto_refused": len(_KTO_REFUSED),
+            },
+        ),
+    ],
+)
+def test_deleting_documented_row_fails_count_assertion(name: str, kwargs: dict):
+    """Mutation check: removing a row from any table fails count check naming the list."""
+    with pytest.raises(AssertionError, match=name):
+        check_documented_row_counts(**kwargs)
 
 
 @pytest.mark.parametrize(
@@ -242,14 +309,21 @@ def test_mixed_text_and_conversational_unification():
 
 
 def test_docs_preference_section_prose_and_anchors():
-    """Verify that expected prose guidance and cross-reference links are in docs/data.md."""
+    """Verify exact prose strings, error messages, and cross-reference links in docs/data.md."""
     text = _DATA_MD.read_text(encoding="utf-8")
     assert "[Preference row layouts (dpo, kto)](#preference-row-layouts-dpo-kto)" in text
     section = _extract_preference_section()
     assert "data.format: dpo" in section
     assert "data.format: kto" in section
     assert "reward_model" in section
-    assert "online_dpo" in section
+    assert "Cannot detect format at row 0" in section
+    assert "... and N more" in section
     assert "Warning: N of M rows dropped: they do not convert as 'dpo'" in section
+    assert "List them all with: soup data validate <source> --format dpo" in section
     assert "soup data validate" in section
+    assert "stops with exit code 1 before loading the model, including under `--dry-run`" in section
     assert "system" in section
+    assert (
+        "Note: N of M train rows are plain-text preference rows in a dataset whose other rows "
+        "are conversations. Each was rewritten"
+    ) in section
